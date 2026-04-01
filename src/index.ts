@@ -16,8 +16,14 @@ type Bindings = {
 // 创建Hono应用
 const app = new Hono<{ Bindings: Bindings }>();
 
-// 中间件
-app.use('/*', cors());
+// CORS中间件 - 允许所有跨域请求
+app.use('/*', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  exposeHeaders: ['Content-Length'],
+  maxAge: 86400,
+}));
 
 // 注意：JWT中间件在各个路由中单独应用，以便区分公开和需要认证的端点
 
