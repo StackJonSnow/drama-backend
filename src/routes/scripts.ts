@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
-import { jwt } from 'hono/jwt';
+import { verify } from 'hono/jwt';
+import type { Context, Next } from 'hono';
 
 type Bindings = {
   DB: D1Database;
@@ -18,8 +19,24 @@ type Variables = {
 
 export const scriptRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
+// 动态JWT认证中间件
+async function jwtAuth(c: Context<{ Bindings: Bindings; Variables: Variables }>, next: Next) {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, error: '未提供认证令牌' }, 401);
+  }
+  const token = authHeader.slice(7);
+  try {
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256');
+    c.set('jwtPayload', payload as any);
+    await next();
+  } catch {
+    return c.json({ success: false, error: '认证令牌无效或已过期' }, 401);
+  }
+}
+
 // 生成剧本
-scriptRoutes.post('/generate', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+scriptRoutes.post('/generate', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const { 
@@ -28,14 +45,14 @@ scriptRoutes.post('/generate', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), asyn
       characters, 
       scene, 
       length, 
-      keyPoints, 
-      aiService,
-      scriptType 
+      key_points, 
+      ai_service,
+      script_type 
     } = await c.req.json();
     
     // 验证输入
-    if (!title || !genre || !scriptType) {
-      return c.json({ error: '标题、类型和剧本类型是必填项' }, 400);
+    if (!title || !genre || !script_type) {
+      return c.json({ success: false, error: '标题、类型和剧本类型是必填项' }, 400);
     }
     
     // 获取用户的AI配置
@@ -50,25 +67,25 @@ scriptRoutes.post('/generate', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), asyn
       characters,
       scene,
       length,
-      keyPoints,
-      scriptType
+      keyPoints: key_points,
+      scriptType: script_type
     });
     
     // 调用AI服务生成剧本
     let scriptContent;
-    let usedAiService = aiService || 'cloudflare-ai';
+    const usedAiService = ai_service || 'cloudflare-ai';
     
-    if (aiService === 'cloudflare-ai' || !aiService) {
+    if (usedAiService === 'cloudflare-ai') {
       // 使用Cloudflare Workers AI
       scriptContent = await generateWithCloudflareAI(c.env.AI, prompt);
-    } else if (aiService === 'openai' && aiConfig?.api_key) {
+    } else if (usedAiService === 'openai' && aiConfig?.api_key) {
       // 使用OpenAI API
       scriptContent = await generateWithOpenAI(aiConfig.api_key as string, prompt);
-    } else if (aiService === 'claude' && aiConfig?.api_key) {
+    } else if (usedAiService === 'claude' && aiConfig?.api_key) {
       // 使用Claude API
       scriptContent = await generateWithClaude(aiConfig.api_key as string, prompt);
     } else {
-      return c.json({ error: '未配置AI服务或API密钥' }, 400);
+      return c.json({ success: false, error: '未配置AI服务或API密钥' }, 400);
     }
     
     // 保存到数据库
@@ -85,38 +102,40 @@ scriptRoutes.post('/generate', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), asyn
       JSON.stringify(characters || []),
       scene || '',
       length || 'short',
-      JSON.stringify(keyPoints || []),
+      JSON.stringify(key_points || []),
       usedAiService,
-      scriptType,
+      script_type,
       new Date().toISOString()
     ).run();
     
     if (!result.success) {
-      return c.json({ error: '保存剧本失败' }, 500);
+      return c.json({ success: false, error: '保存剧本失败' }, 500);
     }
     
     return c.json({
       success: true,
       message: '剧本生成成功',
-      script: {
-        id: result.meta.last_row_id,
-        title,
-        content: scriptContent,
-        genre,
-        scriptType,
-        aiService: usedAiService,
-        createdAt: new Date().toISOString()
+      data: {
+        script: {
+          id: result.meta.last_row_id,
+          title,
+          content: scriptContent,
+          genre,
+          script_type,
+          ai_service: usedAiService,
+          created_at: new Date().toISOString()
+        }
       }
     });
     
   } catch (error) {
     console.error('生成剧本错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 获取用户剧本历史
-scriptRoutes.get('/history', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+scriptRoutes.get('/history', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const page = parseInt(c.req.query('page') || '1');
@@ -151,12 +170,12 @@ scriptRoutes.get('/history', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async 
     
   } catch (error) {
     console.error('获取历史记录错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 获取单个剧本详情
-scriptRoutes.get('/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+scriptRoutes.get('/:id', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const scriptId = c.req.param('id');
@@ -166,22 +185,22 @@ scriptRoutes.get('/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) 
     `).bind(scriptId, payload.userId).first();
     
     if (!script) {
-      return c.json({ error: '剧本不存在' }, 404);
+      return c.json({ success: false, error: '剧本不存在' }, 404);
     }
     
     return c.json({
       success: true,
-      script
+      data: { script }
     });
     
   } catch (error) {
     console.error('获取剧本详情错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 删除剧本
-scriptRoutes.delete('/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+scriptRoutes.delete('/:id', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const scriptId = c.req.param('id');
@@ -191,7 +210,7 @@ scriptRoutes.delete('/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (
     ).bind(scriptId, payload.userId).run();
     
     if (!result.success) {
-      return c.json({ error: '删除失败' }, 500);
+      return c.json({ success: false, error: '删除失败' }, 500);
     }
     
     return c.json({
@@ -201,7 +220,7 @@ scriptRoutes.delete('/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (
     
   } catch (error) {
     console.error('删除剧本错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 

@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
-import { jwt } from 'hono/jwt';
+import { sign, verify } from 'hono/jwt';
+import type { Context, Next } from 'hono';
 
 type Bindings = {
   DB: D1Database;
@@ -17,6 +18,23 @@ type Variables = {
 
 export const authRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
+// 动态JWT认证中间件 — 从env读取secret
+async function jwtAuth(c: Context<{ Bindings: Bindings; Variables: Variables }>, next: Next) {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, error: '未提供认证令牌' }, 401);
+  }
+
+  const token = authHeader.slice(7);
+  try {
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256');
+    c.set('jwtPayload', payload as any);
+    await next();
+  } catch {
+    return c.json({ success: false, error: '认证令牌无效或已过期' }, 401);
+  }
+}
+
 // 用户注册
 authRoutes.post('/register', async (c) => {
   try {
@@ -24,13 +42,13 @@ authRoutes.post('/register', async (c) => {
     
     // 验证输入
     if (!email || !password) {
-      return c.json({ error: '邮箱和密码是必填项' }, 400);
+      return c.json({ success: false, error: '邮箱和密码是必填项' }, 400);
     }
     
     // 检查邮箱格式
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
-      return c.json({ error: '邮箱格式不正确' }, 400);
+      return c.json({ success: false, error: '邮箱格式不正确' }, 400);
     }
     
     // 检查用户是否已存在
@@ -39,10 +57,10 @@ authRoutes.post('/register', async (c) => {
     ).bind(email).first();
     
     if (existingUser) {
-      return c.json({ error: '该邮箱已注册' }, 400);
+      return c.json({ success: false, error: '该邮箱已注册' }, 400);
     }
     
-    // 生成密码哈希（在实际应用中应使用bcrypt等）
+    // 生成密码哈希
     const passwordHash = await hashPassword(password);
     
     // 插入新用户
@@ -51,17 +69,18 @@ authRoutes.post('/register', async (c) => {
     ).bind(email, passwordHash, name || '', new Date().toISOString()).run();
     
     if (!result.success) {
-      return c.json({ error: '注册失败，请稍后重试' }, 500);
+      return c.json({ success: false, error: '注册失败，请稍后重试' }, 500);
     }
     
-    // 生成JWT token
+    // 使用 Hono 的 sign() 生成 JWT token
     const token = await sign(
       { 
         userId: result.meta.last_row_id, 
         email,
         exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7天
       },
-      c.env.JWT_SECRET
+      c.env.JWT_SECRET,
+      'HS256'
     );
     
     return c.json({
@@ -77,7 +96,7 @@ authRoutes.post('/register', async (c) => {
     
   } catch (error) {
     console.error('注册错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
@@ -88,7 +107,7 @@ authRoutes.post('/login', async (c) => {
     
     // 验证输入
     if (!email || !password) {
-      return c.json({ error: '邮箱和密码是必填项' }, 400);
+      return c.json({ success: false, error: '邮箱和密码是必填项' }, 400);
     }
     
     // 查找用户
@@ -97,23 +116,24 @@ authRoutes.post('/login', async (c) => {
     ).bind(email).first();
     
     if (!user) {
-      return c.json({ error: '邮箱或密码错误' }, 401);
+      return c.json({ success: false, error: '邮箱或密码错误' }, 401);
     }
     
     // 验证密码
     const passwordMatch = await verifyPassword(password, user.password_hash as string);
     if (!passwordMatch) {
-      return c.json({ error: '邮箱或密码错误' }, 401);
+      return c.json({ success: false, error: '邮箱或密码错误' }, 401);
     }
     
-    // 生成JWT token
+    // 使用 Hono 的 sign() 生成 JWT token
     const token = await sign(
       { 
         userId: user.id, 
         email: user.email,
         exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7天
       },
-      c.env.JWT_SECRET
+      c.env.JWT_SECRET,
+      'HS256'
     );
     
     return c.json({
@@ -129,12 +149,12 @@ authRoutes.post('/login', async (c) => {
     
   } catch (error) {
     console.error('登录错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 获取当前用户信息
-authRoutes.get('/me', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+authRoutes.get('/me', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     
@@ -143,22 +163,22 @@ authRoutes.get('/me', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => 
     ).bind(payload.userId).first();
     
     if (!user) {
-      return c.json({ error: '用户不存在' }, 404);
+      return c.json({ success: false, error: '用户不存在' }, 404);
     }
     
     return c.json({
       success: true,
-      user
+      data: { user }
     });
     
   } catch (error) {
     console.error('获取用户信息错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 更新用户信息
-authRoutes.put('/profile', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+authRoutes.put('/profile', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const { name, currentPassword, newPassword } = await c.req.json();
@@ -169,10 +189,10 @@ authRoutes.put('/profile', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c
     ).bind(payload.userId).first();
     
     if (!user) {
-      return c.json({ error: '用户不存在' }, 404);
+      return c.json({ success: false, error: '用户不存在' }, 404);
     }
     
-    let updateFields = [];
+    let updateFields: string[] = [];
     let updateValues: any[] = [];
     
     // 更新名字
@@ -185,7 +205,7 @@ authRoutes.put('/profile', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c
     if (currentPassword && newPassword) {
       const passwordMatch = await verifyPassword(currentPassword, user.password_hash as string);
       if (!passwordMatch) {
-        return c.json({ error: '当前密码错误' }, 400);
+        return c.json({ success: false, error: '当前密码错误' }, 400);
       }
       
       const newPasswordHash = await hashPassword(newPassword);
@@ -194,7 +214,7 @@ authRoutes.put('/profile', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c
     }
     
     if (updateFields.length === 0) {
-      return c.json({ error: '没有需要更新的字段' }, 400);
+      return c.json({ success: false, error: '没有需要更新的字段' }, 400);
     }
     
     updateFields.push('updated_at = ?');
@@ -205,7 +225,7 @@ authRoutes.put('/profile', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c
     const result = await c.env.DB.prepare(query).bind(...updateValues).run();
     
     if (!result.success) {
-      return c.json({ error: '更新失败' }, 500);
+      return c.json({ success: false, error: '更新失败' }, 500);
     }
     
     return c.json({
@@ -215,11 +235,11 @@ authRoutes.put('/profile', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c
     
   } catch (error) {
     console.error('更新用户信息错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
-// 辅助函数：密码哈希（简化版，实际应用应使用bcrypt）
+// 辅助函数：密码哈希
 async function hashPassword(password: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(password + 'salt-drama-generator');
@@ -232,14 +252,4 @@ async function hashPassword(password: string): Promise<string> {
 async function verifyPassword(password: string, hash: string): Promise<boolean> {
   const passwordHash = await hashPassword(password);
   return passwordHash === hash;
-}
-
-// 辅助函数：JWT签名（简化版）
-async function sign(payload: any, secret: string): Promise<string> {
-  // 这里使用简化的JWT实现，实际应用应使用成熟的JWT库
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const encodedHeader = btoa(JSON.stringify(header));
-  const encodedPayload = btoa(JSON.stringify(payload));
-  const signature = btoa(`${encodedHeader}.${encodedPayload}.${secret}`);
-  return `${encodedHeader}.${encodedPayload}.${signature}`;
 }

@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { jwt } from 'hono/jwt';
 import { authRoutes } from './routes/auth';
 import { scriptRoutes } from './routes/scripts';
 import { aiRoutes } from './routes/ai';

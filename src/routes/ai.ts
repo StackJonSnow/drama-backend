@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
-import { jwt } from 'hono/jwt';
+import { verify } from 'hono/jwt';
+import type { Context, Next } from 'hono';
 
 type Bindings = {
   DB: D1Database;
@@ -16,6 +17,22 @@ type Variables = {
 };
 
 export const aiRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+
+// 动态JWT认证中间件
+async function jwtAuth(c: Context<{ Bindings: Bindings; Variables: Variables }>, next: Next) {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, error: '未提供认证令牌' }, 401);
+  }
+  const token = authHeader.slice(7);
+  try {
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256');
+    c.set('jwtPayload', payload as any);
+    await next();
+  } catch {
+    return c.json({ success: false, error: '认证令牌无效或已过期' }, 401);
+  }
+}
 
 // 获取支持的AI服务列表
 aiRoutes.get('/services', async (c) => {
@@ -45,12 +62,12 @@ aiRoutes.get('/services', async (c) => {
   
   return c.json({
     success: true,
-    services
+    data: { services }
   });
 });
 
 // 获取用户的AI配置
-aiRoutes.get('/config', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+aiRoutes.get('/config', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     
@@ -60,23 +77,23 @@ aiRoutes.get('/config', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) =
     
     return c.json({
       success: true,
-      configs: configs.results
+      data: { configs: configs.results }
     });
     
   } catch (error) {
     console.error('获取AI配置错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 更新用户的AI配置
-aiRoutes.put('/config', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+aiRoutes.put('/config', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const { serviceName, apiKey } = await c.req.json();
     
     if (!serviceName) {
-      return c.json({ error: '服务名称是必填项' }, 400);
+      return c.json({ success: false, error: '服务名称是必填项' }, 400);
     }
     
     // 检查是否已存在该服务的配置
@@ -87,7 +104,7 @@ aiRoutes.put('/config', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) =
     if (existingConfig) {
       // 更新现有配置
       let updateQuery = 'UPDATE ai_configs SET is_active = 1, updated_at = ?';
-      let updateValues: any[] = [new Date().toISOString()];
+      const updateValues: any[] = [new Date().toISOString()];
       
       if (apiKey) {
         updateQuery += ', api_key = ?';
@@ -129,12 +146,12 @@ aiRoutes.put('/config', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) =
     
   } catch (error) {
     console.error('更新AI配置错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 删除AI配置
-aiRoutes.delete('/config/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+aiRoutes.delete('/config/:id', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const configId = c.req.param('id');
@@ -144,7 +161,7 @@ aiRoutes.delete('/config/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), asyn
     ).bind(configId, payload.userId).run();
     
     if (!result.success) {
-      return c.json({ error: '删除失败' }, 500);
+      return c.json({ success: false, error: '删除失败' }, 500);
     }
     
     return c.json({
@@ -154,14 +171,13 @@ aiRoutes.delete('/config/:id', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), asyn
     
   } catch (error) {
     console.error('删除AI配置错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
 // 测试AI服务连接
-aiRoutes.post('/test', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) => {
+aiRoutes.post('/test', jwtAuth, async (c) => {
   try {
-    const payload = c.get('jwtPayload');
     const { serviceName, apiKey } = await c.req.json();
     
     let testResult = false;
@@ -178,7 +194,7 @@ aiRoutes.post('/test', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) =>
         if (!testResult) {
           errorMessage = 'OpenAI API密钥无效';
         }
-      } catch (e) {
+      } catch {
         errorMessage = '无法连接到OpenAI API';
       }
     } else if (serviceName === 'claude' && apiKey) {
@@ -193,7 +209,7 @@ aiRoutes.post('/test', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) =>
         if (!testResult) {
           errorMessage = 'Claude API密钥无效';
         }
-      } catch (e) {
+      } catch {
         errorMessage = '无法连接到Claude API';
       }
     } else {
@@ -207,7 +223,7 @@ aiRoutes.post('/test', jwt({ secret: 'JWT_SECRET', alg: 'HS256' }), async (c) =>
     
   } catch (error) {
     console.error('测试AI服务错误:', error);
-    return c.json({ error: '服务器内部错误' }, 500);
+    return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
 });
 
