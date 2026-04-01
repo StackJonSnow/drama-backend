@@ -1,0 +1,27 @@
+name = "drama-generator-backend"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 数据库配置
+[[d1_databases]]
+binding = "DB"
+database_name = "drama-generator"
+database_id = "0fd05322-81cd-471e-9b77-b4f008df39c2" # 需要替换为实际的数据库ID
+
+# 环境变量
+[vars]
+ENVIRONMENT = "development"
+JWT_SECRET = "MkS5ZBfJlkpNmmbTAeEYVFF9N+q/ZKc+res6PpHK500=" # 需要替换为实际的密钥
+
+# AI服务配置（可选，用户也可以在运行时配置）
+[ai]
+binding = "AI"
+
+# 开发环境配置
+[env.dev]
+vars = { ENVIRONMENT = "development" }
+
+# 生产环境配置
+[env.production]
+vars = { ENVIRONMENT = "production" }

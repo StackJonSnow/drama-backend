@@ -1,0 +1,23 @@
+{
+  "name": "drama-generator-backend",
+  "version": "1.0.0",
+  "description": "AI剧本生成工具后端 - Cloudflare Workers",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest"
+  },
+  "keywords": ["cloudflare-workers", "ai", "script-generator"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250401.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.79.0",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  }
+}
