@@ -1,6 +1,5 @@
 /**
- * 8步流水线 Prompt 模板
- * 每个模板要求AI输出结构化JSON
+ * 8-step Pipeline Prompt Templates - Enterprise Grade
  */
 
 export interface TaskInput {
@@ -17,439 +16,413 @@ export interface TaskInput {
   totalEpisodes?: number;
 }
 
+const GENRE_MAP: Record<string, string> = {
+  'sci-fi': '科幻', 'romance': '爱情', 'action': '动作',
+  'comedy': '喜剧', 'drama': '剧情', 'horror': '恐怖',
+  'thriller': '悬疑', 'fantasy': '奇幻', 'historical': '历史',
+  'documentary': '纪实',
+};
+
+const TYPE_MAP: Record<string, string> = {
+  'movie': '电影', 'tv': '电视剧', 'short-video': '短视频',
+  'commercial': '广告', 'novel': '小说',
+};
+
+function genreLabel(g: string): string { return GENRE_MAP[g] || g; }
+function typeLabel(t: string): string { return TYPE_MAP[t] || t; }
+
 // ============================================
-// Step 1: 故事大纲生成
+// Step 1: Story Outline
 // ============================================
-export function storyOutlinePrompt(input: TaskInput): { system: string; user: string } {
+export function storyOutlinePrompt(input: TaskInput) {
+  const genre = genreLabel(input.genre);
+  const type = typeLabel(input.scriptType);
+  const totalEps = input.totalEpisodes || 50;
+
   return {
-    system: `你是一位资深剧本策划，擅长构建有吸引力的故事框架。你必须用中文回复，输出严格的JSON格式。`,
-    user: `请根据以下创意输入，生成一个完整的故事大纲。
+    system: [
+      '你是一位拥有20年从业经验的资深编剧和故事策划，曾参与多部院线电影和长篇电视剧的创作。',
+      '你的专长是构建具有商业价值和艺术深度的故事框架。',
+      '',
+      '核心原则：',
+      '1. 故事必须有明确的主题表达和价值主张',
+      '2. 三幕式结构必须遵循经典比例（25%-50%-25%）',
+      '3. 核心冲突必须具有多层性和递进性',
+      '4. 每一幕必须有清晰的转折点和情感高潮',
+      '',
+      '输出要求：仅输出JSON，不输出任何解释性文字。JSON必须可被标准解析器直接解析。',
+    ].join('\n'),
 
-## 创意输入
-- 标题: ${input.title}
-- 题材: ${input.genre}
-- 剧本类型: ${input.scriptType}
-- 风格: ${input.style || '未指定'}
-- 目标平台: ${input.targetPlatform || '未指定'}
-- 用户提供的关键情节点: ${input.keyPoints?.length ? input.keyPoints.join('; ') : '无'}
-- 用户指定场景: ${input.sceneInput || '无'}
-
-## 输出要求
-请输出以下JSON结构（不要输出其他内容）：
-{
-  "title": "故事标题",
-  "logline": "一句话概括故事（20字以内）",
-  "synopsis": "故事梗概（200-300字）",
-  "theme": "主题表达",
-  "coreConflict": "核心冲突描述",
-  "worldSetting": "世界观设定",
-  "tone": "整体基调",
-  "threeActs": {
-    "act1": {
-      "name": "第一幕：建立世界",
-      "description": "描述（100字）",
-      "keyEvents": ["事件1", "事件2"]
-    },
-    "act2": {
-      "name": "第二幕：冲突升级",
-      "description": "描述（100字）",
-      "keyEvents": ["事件1", "事件2", "事件3"]
-    },
-    "act3": {
-      "name": "第三幕：高潮与结局",
-      "description": "描述（100字）",
-      "keyEvents": ["事件1", "事件2"]
-    }
-  }
-}`,
+    user: [
+      `## 项目信息`,
+      `- 项目名称：${input.title}`,
+      `- 题材类型：${genre}`,
+      `- 内容形式：${type}`,
+      `- 总集数：${totalEps}集`,
+      `- 风格定位：${input.style || '未指定，根据题材自行判断'}`,
+      `- 目标平台：${input.targetPlatform || '未指定'}`,
+      `- 用户关键情节点：${input.keyPoints?.length ? input.keyPoints.join('；') : '无'}`,
+      `- 场景描述：${input.sceneInput || '由你创意发挥'}`,
+      '',
+      '## 任务',
+      '请基于以上信息，创作一个完整的故事大纲。',
+      '',
+      '## 输出格式（严格JSON）',
+      JSON.stringify({
+        title: '项目标题',
+        logline: '一句话概括（30字以内，包含主角、目标、冲突）',
+        synopsis: '故事梗概（300-500字，包含起承转合）',
+        theme: '核心主题（如：牺牲与救赎、自由与责任）',
+        coreConflict: '核心矛盾（一句话描述主要对立力量）',
+        worldSetting: '世界观设定（时代背景、社会环境、特殊规则）',
+        tone: '整体基调（如：紧张写实、温暖治愈、冷峻悬疑）',
+        targetAudience: '目标受众画像',
+        threeActs: {
+          act1: { name: '第一幕：建置', description: '世界建立、人物出场、激励事件', keyEvents: ['事件1', '事件2', '转折点事件'] },
+          act2: { name: '第二幕：对抗', description: '冲突升级、考验深化、中点反转', keyEvents: ['事件1', '事件2', '中点反转', '事件3', '最低谷'] },
+          act3: { name: '第三幕：结局', description: '高潮对决、主题升华、最终落幕', keyEvents: ['最终对决', '主题呼应', '结局'] },
+        },
+      }, null, 2),
+    ].join('\n'),
   };
 }
 
 // ============================================
-// Step 2: 角色生成
+// Step 2: Character Generation
 // ============================================
-export function characterGenerationPrompt(input: TaskInput, storyOutline: any): { system: string; user: string } {
+export function characterGenerationPrompt(input: TaskInput, storyOutline: any) {
+  const charCount = input.characterCount || 6;
+
   return {
-    system: `你是一位专业角色设计师，擅长创造立体、有深度的角色。你必须用中文回复，输出严格的JSON格式。`,
-    user: `请根据以下故事大纲，生成完整的角色设定。
+    system: [
+      '你是一位专业的角色设计师和心理学家，擅长创造立体、有深度、有弧线的角色。',
+      '你设计的角色必须：',
+      '1. 每个角色有明确的内在动机和外在目标',
+      '2. 角色之间存在有机的关系网络和戏剧张力',
+      '3. 配角必须服务于主线剧情，各有独特功能',
+      '4. 反派必须有自洽的逻辑和令人同情的动机',
+      '',
+      '输出要求：仅输出JSON，不输出任何解释性文字。',
+    ].join('\n'),
 
-## 故事大纲
-标题: ${storyOutline.title}
-梗概: ${storyOutline.synopsis}
-主题: ${storyOutline.theme}
-核心冲突: ${storyOutline.coreConflict}
-世界观: ${storyOutline.worldSetting}
-
-## 用户指定的角色
-${input.charactersInput?.length ? input.charactersInput.join('; ') : '无，由你自由创作'}
-
-## 角色数量要求
-${input.characterCount ? `请生成${input.characterCount}个角色` : '根据故事需要生成5-10个角色'}
-
-## 输出要求
-请输出以下JSON结构：
-{
-  "protagonist": {
-    "name": "主角姓名",
-    "age": "年龄",
-    "gender": "性别",
-    "appearance": "外貌描述",
-    "personality": "性格特点",
-    "background": "背景故事",
-    "goal": "核心目标",
-    "flaw": "致命缺陷",
-    "arc": "角色弧线（从开始到结束的变化）"
-  },
-  "characters": [
-    {
-      "name": "角色姓名",
-      "role": "角色类型（配角/反派/导师等）",
-      "age": "年龄",
-      "personality": "性格",
-      "background": "背景",
-      "goal": "目标",
-      "relationship": "与主角的关系"
-    }
-  ],
-  "relationships": [
-    {
-      "character1": "角色A",
-      "character2": "角色B",
-      "type": "关系类型",
-      "description": "关系描述",
-      "tension": "冲突点"
-    }
-  ]
-}`,
+    user: [
+      `## 故事背景`,
+      `标题：${storyOutline.title}`,
+      `梗概：${storyOutline.synopsis}`,
+      `主题：${storyOutline.theme}`,
+      `核心冲突：${storyOutline.coreConflict}`,
+      `世界观：${storyOutline.worldSetting}`,
+      '',
+      `## 用户指定角色`,
+      input.charactersInput?.length ? input.charactersInput.join('；') : '无，请根据故事需要自由创作',
+      '',
+      `## 角色数量要求：恰好 ${charCount} 个主要角色`,
+      '',
+      '## 输出格式（严格JSON）',
+      JSON.stringify({
+        protagonist: {
+          name: '姓名', age: '年龄', gender: '性别',
+          appearance: '外貌特征（50字）',
+          personality: '性格标签+具体表现（100字）',
+          background: '成长经历（100字）',
+          goal: '核心目标', flaw: '致命弱点',
+          arc: '角色弧线变化（从A状态到B状态）',
+        },
+        characters: [{
+          name: '姓名', role: '角色功能（盟友/对手/导师/催化剂等）',
+          age: '年龄', personality: '性格', background: '背景',
+          goal: '目标', relationship: '与主角的关系',
+          dramaticFunction: '在剧情中的功能',
+        }],
+        relationships: [{
+          character1: '角色A', character2: '角色B',
+          type: '关系类型', description: '关系描述',
+          tension: '潜在冲突点', evolution: '关系变化轨迹',
+        }],
+      }, null, 2),
+    ].join('\n'),
   };
 }
 
 // ============================================
-// Step 3: 剧情结构
+// Step 3: Plot Structure
 // ============================================
-export function plotStructurePrompt(input: TaskInput, storyOutline: any, characters: any): { system: string; user: string } {
+export function plotStructurePrompt(input: TaskInput, storyOutline: any, characters: any) {
+  const totalEps = input.totalEpisodes || 50;
+  const totalScenes = totalEps * 4;
+
   return {
-    system: `你是一位资深编剧，擅长构建紧凑的剧情结构。你必须用中文回复，输出严格的JSON格式。`,
-    user: `请根据故事大纲和角色设定，构建详细的剧情结构。
+    system: [
+      '你是一位资深编剧行业的结构专家，精通好莱坞三幕式、英雄之旅、序列编剧法等多种叙事结构。',
+      '你设计的剧情结构必须：',
+      '1. 每个场景有明确的叙事功能（推进剧情、揭示信息、塑造角色）',
+      '2. 场景之间有因果链连接，非松散拼接',
+      '3. 冲突必须层层递进，张弛有度',
+      '4. 伏笔与呼应必须有清晰的对应关系',
+      '',
+      '输出要求：仅输出JSON。',
+    ].join('\n'),
 
-## 故事大纲
-${JSON.stringify(storyOutline, null, 2)}
-
-## 角色设定
-主角: ${characters.protagonist.name} - ${characters.protagonist.personality}
-配角: ${characters.characters.map((c: any) => `${c.name}(${c.role})`).join(', ')}
-
-## 输出要求
-请输出以下JSON结构：
-{
-  "act1": {
-    "scenes": [
-      {
-        "sceneNumber": 1,
-        "name": "场景名称",
-        "location": "地点",
-        "time": "时间（白天/夜晚）",
-        "characters": ["出场角色"],
-        "description": "场景描述",
-        "purpose": "叙事目的",
-        "emotion": "情绪基调",
-        "conflict": "冲突点"
-      }
-    ]
-  },
-  "act2": {
-    "scenes": [
-      {
-        "sceneNumber": 4,
-        "name": "...",
-        "location": "...",
-        "time": "...",
-        "characters": ["..."],
-        "description": "...",
-        "purpose": "...",
-        "emotion": "...",
-        "conflict": "..."
-      }
-    ]
-  },
-  "act3": {
-    "scenes": [
-      {
-        "sceneNumber": 15,
-        "name": "...",
-        "location": "...",
-        "time": "...",
-        "characters": ["..."],
-        "description": "...",
-        "purpose": "...",
-        "emotion": "...",
-        "conflict": "..."
-      }
-    ]
-  },
-  "totalScenes": 20
-}
-
-注意：请生成足够多的场景来支撑${input.totalEpisodes || 50}集的剧情。每幕至少8-15个场景。`,
+    user: [
+      `## 故事信息`,
+      `标题：${storyOutline.title}`,
+      `三幕结构：${storyOutline.threeActs.act1.name} → ${storyOutline.threeActs.act2.name} → ${storyOutline.threeActs.act3.name}`,
+      '',
+      `## 角色信息`,
+      `主角：${characters.protagonist.name}（${characters.protagonist.personality}）`,
+      `配角：${characters.characters.map((c: any) => `${c.name}(${c.role})`).join('、')}`,
+      '',
+      `## 场景数量：约 ${totalScenes} 个`,
+      `- 第一幕：约 ${Math.floor(totalScenes * 0.2)} 个`,
+      `- 第二幕：约 ${Math.floor(totalScenes * 0.55)} 个`,
+      `- 第三幕：约 ${Math.floor(totalScenes * 0.25)} 个`,
+      '',
+      '## 输出格式（严格JSON）',
+      JSON.stringify({
+        act1: { scenes: [{ sceneNumber: 1, name: '场景名', location: '地点', time: '时间', characters: ['角色名'], description: '场景描述（80字）', purpose: '叙事功能', emotion: '情绪基调', conflict: '冲突点', turningPoint: false }] },
+        act2: { scenes: '同上格式' },
+        act3: { scenes: '同上格式' },
+        totalScenes: '总数',
+        turningPoints: [{ sceneNumber: 1, description: '转折点描述' }],
+      }, null, 2),
+    ].join('\n'),
   };
 }
 
 // ============================================
-// Step 4: 集数拆分计划
+// Step 4: Episode Planning
 // ============================================
-export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotStructure: any, totalEpisodes: number): { system: string; user: string } {
+export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotStructure: any, totalEpisodes: number) {
+  const act1End = Math.floor(totalEpisodes * 0.2);
+  const act2End = Math.floor(totalEpisodes * 0.75);
+
   return {
-    system: `你是一位经验丰富的电视剧编剧，擅长将剧情拆分为多集连贯的剧本。你必须用中文回复，输出严格的JSON格式。`,
-    user: `请将以下剧情结构拆分为${totalEpisodes}集的剧本计划。
+    system: [
+      '你是一位经验丰富的电视剧总编剧，擅长将长篇叙事拆分为引人入胜的分集结构。',
+      '你的分集策略必须：',
+      '1. 每集有独立的小冲突和小高潮',
+      '2. 每集结尾必须有悬念或转折，驱动观众看下一集',
+      '3. 集与集之间有剧情连贯性，但也有节奏变化',
+      '4. 关键情节点必须落在特定集数上形成大高潮',
+      '',
+      `输出要求：仅输出JSON，episodes数组必须恰好包含 ${totalEpisodes} 项。`,
+    ].join('\n'),
 
-## 故事大纲
-标题: ${storyOutline.title}
-三幕结构:
-- 第一幕: ${storyOutline.threeActs.act1.description}
-- 第二幕: ${storyOutline.threeActs.act2.description}
-- 第三幕: ${storyOutline.threeActs.act3.description}
-
-## 剧情结构
-总场景数: ${plotStructure.totalScenes}
-第一幕场景: ${plotStructure.act1.scenes.length}个
-第二幕场景: ${plotStructure.act2.scenes.length}个
-第三幕场景: ${plotStructure.act3.scenes.length}个
-
-## 集数分配建议
-- 第一幕 (建立世界): 约${Math.floor(totalEpisodes * 0.2)}集
-- 第二幕 (冲突升级): 约${Math.floor(totalEpisodes * 0.55)}集
-- 第三幕 (高潮与结局): 约${Math.floor(totalEpisodes * 0.25)}集
-
-## 输出要求
-请输出以下JSON结构（必须包含恰好${totalEpisodes}集）：
-{
-  "episodes": [
-    {
-      "episodeNumber": 1,
-      "title": "集标题",
-      "act": "first_act",
-      "summary": "本集摘要（100字）",
-      "keyEvents": ["事件1", "事件2"],
-      "cliffhanger": "结尾悬念",
-      "scenes": ["涉及的场景编号"]
-    }
-  ],
-  "arcBreakdown": {
-    "firstActEpisodes": "1-10集",
-    "secondActEpisodes": "11-37集",
-    "thirdActEpisodes": "38-50集"
-  }
-}`,
+    user: [
+      `## 故事信息`,
+      `标题：${storyOutline.title}`,
+      `梗概：${storyOutline.synopsis}`,
+      '',
+      `## 剧情结构概览`,
+      `总场景数：${plotStructure.totalScenes}`,
+      '',
+      `## 集数分配（共${totalEpisodes}集）`,
+      `- 第一幕：第1-${act1End}集`,
+      `- 第二幕：第${act1End + 1}-${act2End}集`,
+      `- 第三幕：第${act2End + 1}-${totalEpisodes}集`,
+      '',
+      `## 输出格式（严格JSON，episodes必须恰好${totalEpisodes}项）`,
+      JSON.stringify({
+        episodes: [{
+          episodeNumber: 1, title: '集标题',
+          act: 'first_act | second_act | third_act',
+          summary: '本集摘要（100-150字）',
+          keyEvents: ['核心事件1', '核心事件2'],
+          cliffhanger: '结尾悬念（驱动观众看下一集）',
+          emotionalTone: '情绪基调',
+          pacing: 'slow-build | steady | accelerating | climax',
+        }],
+        majorCliffhangers: [{ episodeNumber: 5, description: '关键悬念' }],
+      }, null, 2),
+    ].join('\n'),
   };
 }
 
 // ============================================
-// Step 5: 单集场景生成
+// Step 5: Scene Generation
 // ============================================
-export function sceneGenerationPrompt(
-  input: TaskInput,
-  storyOutline: any,
-  characters: any,
-  episode: any,
-  previousEpisodes: any[]
-): { system: string; user: string } {
+export function sceneGenerationPrompt(input: TaskInput, storyOutline: any, characters: any, episode: any, previousEpisodes: any[]) {
   const prevSummary = previousEpisodes.length > 0
-    ? `## 前情提要\n${previousEpisodes.slice(-3).map(e => `第${e.episode_number}集: ${e.summary}`).join('\n')}`
-    : '';
+    ? previousEpisodes.slice(-2).map(e => `第${e.episode_number}集「${e.title}」: ${e.summary}`).join('\n')
+    : '这是第一集，无前情。';
 
   return {
-    system: `你是一位专业编剧，擅长设计有冲突和张力的场景。你必须用中文回复，输出严格的JSON格式。`,
-    user: `请为第${episode.episode_number}集生成详细场景。
+    system: [
+      '你是一位专业的场景编剧，擅长设计紧凑、有张力、有视觉冲击力的场景。',
+      '每个场景必须有明确的进入点和退出点，包含至少一个戏剧冲突，动作描写具体可拍摄。',
+      '',
+      '输出要求：仅输出JSON。',
+    ].join('\n'),
 
-## 本集信息
-标题: ${episode.title}
-摘要: ${episode.summary}
-关键事件: ${episode.key_events}
-${prevSummary}
-
-## 角色信息
-主角: ${characters.protagonist.name} - ${characters.protagonist.personality}
-可用角色: ${characters.characters.map((c: any) => `${c.name}(${c.role})`).join(', ')}
-
-## 世界观
-${storyOutline.worldSetting}
-
-## 输出要求
-请为本集生成4-6个场景，输出JSON：
-{
-  "scenes": [
-    {
-      "sceneNumber": 1,
-      "intOrExt": "INT",
-      "location": "具体地点",
-      "time": "夜晚",
-      "characters": ["出场角色名"],
-      "action": "场景中的动作描述（200字）",
-      "emotion": "情绪基调",
-      "conflict": "场景中的冲突",
-      "purpose": "叙事目的"
-    }
-  ]
-}`,
+    user: [
+      `## 第${episode.episodeNumber}集：${episode.title}`,
+      `摘要：${episode.summary}`,
+      `核心事件：${episode.key_events || (Array.isArray(episode.keyEvents) ? episode.keyEvents.join('；') : '')}`,
+      `结尾悬念：${episode.cliffhanger}`,
+      '',
+      `## 前情提要`,
+      prevSummary,
+      '',
+      `## 角色库`,
+      `主角：${characters.protagonist.name}（${characters.protagonist.personality}）`,
+      characters.characters.map((c: any) => `${c.name}（${c.role}：${c.personality}）`).join('\n'),
+      '',
+      `## 请生成4-6个场景`,
+      '## 输出格式（严格JSON）',
+      JSON.stringify({
+        scenes: [{
+          sceneNumber: 1, intOrExt: 'INT | EXT',
+          location: '具体地点', timeOfDay: '白天/黄昏/夜晚',
+          characters: ['出场角色'],
+          action: '场景动作描写（150-200字，具体、可拍摄）',
+          emotion: '情绪基调', conflict: '核心冲突',
+          purpose: '叙事目的',
+        }],
+      }, null, 2),
+    ].join('\n'),
   };
 }
 
 // ============================================
-// Step 6: 对白生成
+// Step 6: Dialogue Generation
 // ============================================
-export function dialogueGenerationPrompt(
-  input: TaskInput,
-  characters: any,
-  episode: any,
-  scenes: any[]
-): { system: string; user: string } {
+export function dialogueGenerationPrompt(input: TaskInput, characters: any, episode: any, scenes: any[]) {
   const charProfiles = [
-    `主角 ${characters.protagonist.name}: ${characters.protagonist.personality}`,
-    ...characters.characters.map((c: any) => `${c.name}: ${c.personality}`)
+    `【主角】${characters.protagonist.name}：${characters.protagonist.personality}。说话风格：${inferSpeechStyle(characters.protagonist.personality)}`,
+    ...characters.characters.map((c: any) => `【${c.role}】${c.name}：${c.personality}。说话风格：${inferSpeechStyle(c.personality)}`),
   ].join('\n');
 
+  const sceneDescs = scenes.map((s: any) =>
+    `场景${s.sceneNumber}: ${s.intOrExt}. ${s.location} - ${s.timeOfDay}\n  情绪：${s.emotion} | 冲突：${s.conflict}\n  动作：${s.action}`
+  ).join('\n\n');
+
   return {
-    system: `你是一位顶级对白编剧，擅长写出符合人物性格、推动剧情、自然流畅的对话。你必须用中文回复，输出严格的JSON格式。`,
-    user: `请为第${episode.episode_number}集的场景生成对白。
+    system: [
+      '你是一位顶级对白编剧，精通"潜台词"和"冰山理论"。',
+      '对白必须：符合角色语言习惯、表面与真实意图有张力、节奏有变化、用对话推动剧情。',
+      '避免"说明书式"对话（角色不会直接说出内心想法）。',
+      '',
+      '输出要求：仅输出JSON。',
+    ].join('\n'),
 
-## 角色性格特征
-${charProfiles}
-
-## 本集场景
-${scenes.map((s: any) => `场景${s.sceneNumber}: ${s.intOrExt}. ${s.location} - ${s.time}\n  动作: ${s.action}\n  冲突: ${s.conflict}`).join('\n\n')}
-
-## 对白要求
-1. 对话必须符合每个角色的性格特征
-2. 对话要推动剧情发展
-3. 语言要自然流畅，避免书面化
-4. 包含适当的动作提示
-5. 每个场景至少3-5轮对话
-
-## 输出格式
-请输出JSON：
-{
-  "dialogues": [
-    {
-      "sceneNumber": 1,
-      "lines": [
-        {
-          "character": "角色名",
-          "line": "对白内容",
-          "action": "动作/表情提示（可选）"
-        }
-      ]
-    }
-  ]
-}`,
+    user: [
+      `## 第${episode.episodeNumber}集：${episode.title}`,
+      '',
+      `## 角色语言档案`,
+      charProfiles,
+      '',
+      `## 场景列表`,
+      sceneDescs,
+      '',
+      `## 对白要求`,
+      '- 每个场景4-6轮对话，每句不超过40字',
+      '- 包含动作/表情提示（方括号内）',
+      '- 结尾为下一场景或集尾悬念做铺垫',
+      '',
+      '## 输出格式（严格JSON）',
+      JSON.stringify({
+        dialogues: [{
+          sceneNumber: 1,
+          lines: [
+            { character: '角色名', line: '对白内容', action: '动作提示（可选）' },
+          ],
+        }],
+      }, null, 2),
+    ].join('\n'),
   };
 }
 
 // ============================================
-// Step 7: 剧本合成 (格式化为Markdown)
+// Step 7: Script Composition
 // ============================================
-export function scriptCompositionPrompt(
-  episode: any,
-  scenes: any[],
-  dialogues: any[]
-): { system: string; user: string } {
+export function scriptCompositionPrompt(episode: any, scenes: any[], dialogues: any[]) {
   return {
-    system: `你是一位专业剧本排版师，擅长将场景和对白合成为标准剧本格式。你必须用中文回复，输出标准Markdown格式的剧本。`,
-    user: `请将以下内容合成为标准剧本格式，使用Markdown排版。
+    system: [
+      '你是一位专业的剧本排版师，熟悉国际标准剧本格式和Markdown排版规范。',
+      '使用标准剧本格式（INT./EXT.、角色名居中大写、对白缩进），Markdown语法实现格式化。',
+      '仅输出排版好的剧本内容，不输出任何解释。',
+    ].join('\n'),
 
-## 第${episode.episode_number}集: ${episode.title}
-
-## 场景列表
-${JSON.stringify(scenes, null, 2)}
-
-## 对白内容
-${JSON.stringify(dialogues, null, 2)}
-
-## 输出格式要求
-请严格按照以下Markdown格式输出：
-
-\`\`\`markdown
-# 第${episode.episode_number}集: ${episode.title}
-
-> ${episode.summary}
-
----
-
-## 场景 1
-
-**${scenes[0]?.intOrExt || 'INT'}. ${scenes[0]?.location || '场景'} - ${scenes[0]?.time || '白天'}**
-
-*[${scenes[0]?.action || ''}]*
-
-**${dialogues[0]?.lines?.[0]?.character || '角色'}**
-> 对白内容
-
-*[动作提示]*
-
-**另一角色**
-> 对白内容
-
----
-
-## 场景 2
-
-...以此类推
-\`\`\`
-
-请输出完整的剧本内容，不要省略任何场景或对白。`,
+    user: [
+      `# 第${episode.episodeNumber}集：${episode.title}`,
+      '',
+      `> ${episode.summary}`,
+      '',
+      `## 场景数据`,
+      JSON.stringify(scenes, null, 2),
+      '',
+      `## 对白数据`,
+      JSON.stringify(dialogues, null, 2),
+      '',
+      `## 输出格式`,
+      '```markdown',
+      `# 第${episode.episodeNumber}集：${episode.title}`,
+      '',
+      `> ${episode.summary}`,
+      '',
+      '---',
+      '',
+      '## 场景 1',
+      '',
+      '**INT. 地点 - 夜晚**',
+      '',
+      '*[场景动作描写]*',
+      '',
+      '**角色A**',
+      '> 对白内容',
+      '',
+      '*[动作提示]*',
+      '',
+      '**角色B**',
+      '> 对白内容',
+      '',
+      '---',
+      '```',
+    ].join('\n'),
   };
 }
 
 // ============================================
-// Step 8: 剧本评分
+// Step 8: Evaluation
 // ============================================
-export function evaluationPrompt(input: TaskInput, storyOutline: any, episodeContent: string): { system: string; user: string } {
+export function evaluationPrompt(input: TaskInput, storyOutline: any, episodeContent: string) {
   return {
-    system: `你是一位专业的剧本评审专家，擅长从多个维度评估剧本质量。你必须用中文回复，输出严格的JSON格式。`,
-    user: `请对以下剧本内容进行专业评分。
+    system: [
+      '你是一位资深剧本评审专家，曾担任多个影视奖项的评委。',
+      '评分标准：1-3差 | 4-5及格 | 6-7良好 | 8-9优秀 | 10卓越',
+      '',
+      '输出要求：仅输出JSON，评分必须是1-10的整数。',
+    ].join('\n'),
 
-## 故事信息
-标题: ${storyOutline.title}
-题材: ${input.genre}
-主题: ${storyOutline.theme}
-
-## 剧本内容（节选前2000字）
-${episodeContent.substring(0, 2000)}
-
-## 评分维度（1-10分）
-1. 剧情 (plot): 故事逻辑性、冲突设置、情节推进
-2. 对白 (dialogue): 对话自然度、角色语言一致性、对话推动剧情
-3. 人物 (character): 角色立体度、人物弧线、角色动机
-4. 节奏 (pacing): 剧情节奏控制、张弛有度
-5. 创意 (creativity): 原创性、创新元素
-
-## 输出格式
-请输出JSON：
-{
-  "plot": {
-    "score": 8,
-    "comment": "剧情评价"
-  },
-  "dialogue": {
-    "score": 7,
-    "comment": "对白评价"
-  },
-  "character": {
-    "score": 8,
-    "comment": "人物评价"
-  },
-  "pacing": {
-    "score": 7,
-    "comment": "节奏评价"
-  },
-  "creativity": {
-    "score": 6,
-    "comment": "创意评价"
-  },
-  "overall": 7.2,
-  "suggestions": [
-    "优化建议1",
-    "优化建议2"
-  ]
-}`,
+    user: [
+      `## 项目信息`,
+      `标题：${storyOutline.title}`,
+      `题材：${genreLabel(input.genre)}`,
+      `主题：${storyOutline.theme}`,
+      '',
+      `## 评审样本（第一集节选）`,
+      episodeContent.substring(0, 2000),
+      '',
+      '## 输出格式（严格JSON）',
+      JSON.stringify({
+        plot: { score: 8, comment: '剧情结构评价（50字）' },
+        dialogue: { score: 7, comment: '对白质量评价（50字）' },
+        character: { score: 8, comment: '角色塑造评价（50字）' },
+        pacing: { score: 7, comment: '节奏控制评价（50字）' },
+        creativity: { score: 6, comment: '创意价值评价（50字）' },
+        overall: 7.2,
+        strengths: ['优点1', '优点2'],
+        suggestions: ['优化建议1', '优化建议2'],
+      }, null, 2),
+    ].join('\n'),
   };
+}
+
+function inferSpeechStyle(personality: string): string {
+  if (personality.includes('幽默') || personality.includes('开朗')) return '轻松活泼，常用比喻和玩笑';
+  if (personality.includes('严肃') || personality.includes('冷')) return '简洁克制，少用修饰语';
+  if (personality.includes('温柔') || personality.includes('善良')) return '温和委婉，多用商量语气';
+  if (personality.includes('强势') || personality.includes('果断')) return '直接有力，少废话';
+  if (personality.includes('狡猾') || personality.includes('深沉')) return '话中有话，善于试探';
+  return '自然口语化';
 }
