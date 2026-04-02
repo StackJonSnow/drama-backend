@@ -86,16 +86,15 @@ async function callAI(
   userMsg: string,
   context: PipelineContext,
   jsonMode = true,
-  timeoutMs = 6000000  // 6000秒超时
+  timeoutMs = 120000
 ): Promise<any> {
   const messages = [
     { role: 'system' as const, content: systemMsg },
     { role: 'user' as const, content: userMsg },
   ];
 
-  context.onLog?.(`[AI调用] 发送请求 (超时: ${timeoutMs / 1000}s)...`);
+  context.onLog?.(`[AI] 正在调用 ${provider.name}...`);
 
-  // 带超时的Promise竞速
   const aiPromise = provider.chat(messages, {
     maxTokens: 8192,
     temperature: 0.7,
@@ -106,7 +105,6 @@ async function callAI(
     const timer = setTimeout(() => {
       reject(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
     }, timeoutMs);
-    // 如果有abortSignal，也要清理
     context.abortSignal?.addEventListener('abort', () => {
       clearTimeout(timer);
       reject(new Error('PIPELINE_ABORTED'));
@@ -115,12 +113,31 @@ async function callAI(
 
   const response = await Promise.race([aiPromise, timeoutPromise]);
 
-  context.onLog?.(`[AI调用] 收到响应 (${response.content.length}字)`);
+  const preview = response.content.substring(0, 200).replace(/\n/g, ' ');
+  context.onLog?.(`[AI] 收到响应 ${response.content.length}字 | ${preview}...`);
 
   if (jsonMode) {
-    return parseJsonResponse(response.content);
+    try {
+      return parseJsonResponse(response.content);
+    } catch (parseErr) {
+      context.onLog?.(`[AI] JSON解析失败，尝试截取有效部分...`);
+      const extracted = extractJson(response.content);
+      if (extracted) return extracted;
+      throw parseErr;
+    }
   }
   return response.content;
+}
+
+function extractJson(text: string): any | null {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start !== -1 && end !== -1 && end > start) {
+    try {
+      return JSON.parse(text.substring(start, end + 1));
+    } catch {}
+  }
+  return null;
 }
 
 /**

@@ -148,42 +148,43 @@ export function characterGenerationPrompt(input: TaskInput, storyOutline: any) {
 // Step 3: Plot Structure
 // ============================================
 export function plotStructurePrompt(input: TaskInput, storyOutline: any, characters: any) {
-  const totalEps = input.totalEpisodes || 50;
-  const totalScenes = totalEps * 4;
+  const act1Scenes = 5;
+  const act2Scenes = 10;
+  const act3Scenes = 5;
 
   return {
     system: [
-      '你是一位资深编剧行业的结构专家，精通好莱坞三幕式、英雄之旅、序列编剧法等多种叙事结构。',
+      '你是一位资深编剧行业的结构专家，精通好莱坞三幕式叙事结构。',
       '你设计的剧情结构必须：',
-      '1. 每个场景有明确的叙事功能（推进剧情、揭示信息、塑造角色）',
-      '2. 场景之间有因果链连接，非松散拼接',
-      '3. 冲突必须层层递进，张弛有度',
-      '4. 伏笔与呼应必须有清晰的对应关系',
+      '1. 每个场景有明确的叙事功能',
+      '2. 场景之间有因果链连接',
+      '3. 冲突层层递进，张弛有度',
       '',
-      '输出要求：仅输出JSON。',
+      '输出要求：仅输出JSON，不要输出超过20个场景。',
     ].join('\n'),
 
     user: [
       `## 故事信息`,
       `标题：${storyOutline.title}`,
-      `三幕结构：${storyOutline.threeActs.act1.name} → ${storyOutline.threeActs.act2.name} → ${storyOutline.threeActs.act3.name}`,
+      `梗概：${storyOutline.synopsis}`,
+      `核心冲突：${storyOutline.coreConflict}`,
       '',
       `## 角色信息`,
       `主角：${characters.protagonist.name}（${characters.protagonist.personality}）`,
       `配角：${characters.characters.map((c: any) => `${c.name}(${c.role})`).join('、')}`,
       '',
-      `## 场景数量：约 ${totalScenes} 个`,
-      `- 第一幕：约 ${Math.floor(totalScenes * 0.2)} 个`,
-      `- 第二幕：约 ${Math.floor(totalScenes * 0.55)} 个`,
-      `- 第三幕：约 ${Math.floor(totalScenes * 0.25)} 个`,
+      `## 请生成高层级的剧情结构（约20个场景）`,
+      `- 第一幕（建置）：约${act1Scenes}个场景`,
+      `- 第二幕（对抗）：约${act2Scenes}个场景`,
+      `- 第三幕（结局）：约${act3Scenes}个场景`,
       '',
       '## 输出格式（严格JSON）',
       JSON.stringify({
-        act1: { scenes: [{ sceneNumber: 1, name: '场景名', location: '地点', time: '时间', characters: ['角色名'], description: '场景描述（80字）', purpose: '叙事功能', emotion: '情绪基调', conflict: '冲突点', turningPoint: false }] },
-        act2: { scenes: '同上格式' },
-        act3: { scenes: '同上格式' },
-        totalScenes: '总数',
-        turningPoints: [{ sceneNumber: 1, description: '转折点描述' }],
+        act1: { scenes: [{ sceneNumber: 1, name: '场景名', location: '地点', time: '时间', characters: ['角色名'], description: '场景描述（80字）', purpose: '叙事功能', emotion: '情绪基调', conflict: '冲突点' }] },
+        act2: { scenes: '同上格式，约10个' },
+        act3: { scenes: '同上格式，约5个' },
+        totalScenes: 20,
+        turningPoints: [{ sceneNumber: 5, description: '转折点描述' }],
       }, null, 2),
     ].join('\n'),
   };
