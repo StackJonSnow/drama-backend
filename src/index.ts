@@ -3,6 +3,7 @@ import { cors } from 'hono/cors';
 import { authRoutes } from './routes/auth';
 import { scriptRoutes } from './routes/scripts';
 import { aiRoutes } from './routes/ai';
+import { pipelineRoutes } from './routes/pipeline';
 
 // 定义环境变量类型
 type Bindings = {
@@ -30,6 +31,7 @@ app.use('/*', cors({
 app.route('/api/auth', authRoutes);
 app.route('/api/scripts', scriptRoutes);
 app.route('/api/ai', aiRoutes);
+app.route('/api/pipeline', pipelineRoutes);
 
 // 健康检查
 app.get('/', (c) => {
