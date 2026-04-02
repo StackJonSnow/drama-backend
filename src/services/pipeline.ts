@@ -27,6 +27,7 @@ export interface PipelineContext {
   onStepComplete?: (step: number, name: string, data: any) => Promise<void>;
   onEpisodeComplete?: (episodeNumber: number, total: number) => Promise<void>;
   onLog?: (message: string) => void;
+  onError?: (step: number, stepName: string, error: string) => Promise<void>;
 }
 
 export type PipelineStepResult = {
@@ -77,27 +78,42 @@ function parseJsonResponse(text: string): any {
 }
 
 /**
- * 执行单个AI调用并解析结果
+ * 执行单个AI调用并解析结果（带超时）
  */
 async function callAI(
   provider: AIProvider,
   systemMsg: string,
   userMsg: string,
   context: PipelineContext,
-  jsonMode = true
+  jsonMode = true,
+  timeoutMs = 6000000  // 6000秒超时
 ): Promise<any> {
   const messages = [
     { role: 'system' as const, content: systemMsg },
     { role: 'user' as const, content: userMsg },
   ];
 
-  context.onLog?.(`[AI调用] 发送请求...`);
+  context.onLog?.(`[AI调用] 发送请求 (超时: ${timeoutMs / 1000}s)...`);
 
-  const response = await provider.chat(messages, {
+  // 带超时的Promise竞速
+  const aiPromise = provider.chat(messages, {
     maxTokens: 8192,
     temperature: 0.7,
     jsonMode: jsonMode && provider.name === 'openai',
   });
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
+    }, timeoutMs);
+    // 如果有abortSignal，也要清理
+    context.abortSignal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new Error('PIPELINE_ABORTED'));
+    }, { once: true });
+  });
+
+  const response = await Promise.race([aiPromise, timeoutPromise]);
 
   context.onLog?.(`[AI调用] 收到响应 (${response.content.length}字)`);
 
@@ -105,6 +121,31 @@ async function callAI(
     return parseJsonResponse(response.content);
   }
   return response.content;
+}
+
+/**
+ * 记录步骤错误到数据库并推送给SSE
+ */
+async function recordStepError(
+  context: PipelineContext,
+  stepNumber: number,
+  stepName: string,
+  error: unknown
+): Promise<void> {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  context.onLog?.(`[Step ${stepNumber}] 错误: ${errorMessage}`);
+
+  // 更新步骤状态为失败
+  try {
+    await context.db.prepare(
+      'UPDATE pipeline_steps SET status = ?, error_message = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
+    ).bind('failed', errorMessage, new Date().toISOString(), context.taskId, stepNumber).run();
+  } catch (dbErr) {
+    console.error(`Failed to record step error:`, dbErr);
+  }
+
+  // 推送错误事件
+  await context.onError?.(stepNumber, stepName, errorMessage);
 }
 
 /**

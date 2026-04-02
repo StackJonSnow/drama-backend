@@ -508,6 +508,83 @@ pipelineRoutes.get('/list', jwtAuth, async (c) => {
   }
 });
 
+/**
+ * GET /api/pipeline/:id/steps
+ * 获取流水线所有步骤状态和内容
+ */
+pipelineRoutes.get('/:id/steps', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id') || '';
+
+    const task = await c.env.DB.prepare(
+      'SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?'
+    ).bind(taskId, payload.userId).first();
+
+    if (!task) {
+      return c.json({ success: false, error: '任务不存在' }, 404);
+    }
+
+    const steps = await c.env.DB.prepare(
+      'SELECT step_number, step_name, status, error_message, started_at, completed_at FROM pipeline_steps WHERE task_id = ? ORDER BY step_number'
+    ).bind(taskId).all();
+
+    return c.json({
+      success: true,
+      data: { steps: steps.results },
+    });
+
+  } catch (error) {
+    console.error('获取步骤状态错误:', error);
+    return c.json({ success: false, error: '获取步骤状态失败' }, 500);
+  }
+});
+
+/**
+ * GET /api/pipeline/:id/steps/:step/content
+ * 获取单个步骤的生成内容（预览）
+ */
+pipelineRoutes.get('/:id/steps/:step/content', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id') || '';
+    const stepNumber = parseInt(c.req.param('step') || '0');
+
+    const task = await c.env.DB.prepare(
+      'SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?'
+    ).bind(taskId, payload.userId).first();
+
+    if (!task) {
+      return c.json({ success: false, error: '任务不存在' }, 404);
+    }
+
+    const step = await c.env.DB.prepare(
+      'SELECT * FROM pipeline_steps WHERE task_id = ? AND step_number = ?'
+    ).bind(taskId, stepNumber).first();
+
+    if (!step) {
+      return c.json({ success: false, error: '步骤不存在' }, 404);
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        step_number: step.step_number,
+        step_name: step.step_name,
+        status: step.status,
+        content: step.content ? JSON.parse(step.content as string) : null,
+        error_message: step.error_message,
+        started_at: step.started_at,
+        completed_at: step.completed_at,
+      },
+    });
+
+  } catch (error) {
+    console.error('获取步骤内容错误:', error);
+    return c.json({ success: false, error: '获取步骤内容失败' }, 500);
+  }
+});
+
 // ============================================
 // 后台流水线执行
 // ============================================
@@ -517,6 +594,8 @@ async function runPipeline(
   taskId: string,
   userId: number
 ) {
+  const pendingErrors: { step: number; name: string; message: string }[] = [];
+
   try {
     // 获取任务信息
     const task = await c.env.DB.prepare(
@@ -526,16 +605,6 @@ async function runPipeline(
     if (!task) return;
 
     // 获取AI Provider
-    let apiKey: string | undefined;
-    if (task.ai_service !== 'cloudflare-ai') {
-      const config = await c.env.DB.prepare(
-        'SELECT api_key FROM ai_configs WHERE user_id = ? AND service_name = ? AND is_active = 1'
-      ).bind(userId, task.ai_service).first();
-      if (config?.api_key) {
-        try { apiKey = atob(config.api_key as string); } catch { apiKey = config.api_key as string; }
-      }
-    }
-
     const provider = await getUserAIProvider(userId, c.env);
 
     const input: TaskInput = {
@@ -564,119 +633,144 @@ async function runPipeline(
       }
     }
 
-    // 检查当前应该从哪步继续
     const currentStep = task.current_step as number;
 
-    // Phase 1: 步骤 1-4
-    if (currentStep < 4) {
-      // 构建上下文（从已完成的步骤恢复）
-      const context = {
-        taskId,
-        userId,
-        input,
-        provider,
-        db: c.env.DB,
-        totalEpisodes: task.total_episodes as number,
-        onStepComplete: async (step: number, name: string, data: any) => {
-          stepResults[step] = data;
-          await c.env.DB.prepare(
-            'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
-          ).bind(JSON.stringify(data), 'completed', new Date().toISOString(), taskId, step).run();
-          await c.env.DB.prepare(
-            'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ? AND status = ?'
-          ).bind('running', new Date().toISOString(), taskId, step + 1, 'pending').run();
-          await c.env.DB.prepare(
-            'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
-          ).bind(step, new Date().toISOString(), taskId).run();
-        },
-        onEpisodeComplete: async () => {},
-        onLog: (msg: string) => console.log(`[${taskId}] ${msg}`),
-      };
-
-      // Step 1: 如果已完成则跳过
-      if (!stepResults[1]) {
-        await c.env.DB.prepare(
-          'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
-        ).bind('running', new Date().toISOString(), taskId, 1).run();
-        stepResults[1] = await executeStep1(context);
-      }
-
-      // Step 2
-      if (!stepResults[2]) {
-        await c.env.DB.prepare(
-          'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
-        ).bind('running', new Date().toISOString(), taskId, 2).run();
-        stepResults[2] = await executeStep2(context, stepResults[1]);
-      }
-
-      // Step 3
-      if (!stepResults[3]) {
-        await c.env.DB.prepare(
-          'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
-        ).bind('running', new Date().toISOString(), taskId, 3).run();
-        stepResults[3] = await executeStep3(context, stepResults[1], stepResults[2]);
-      }
-
-      // Step 4
-      if (!stepResults[4]) {
-        await c.env.DB.prepare(
-          'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
-        ).bind('running', new Date().toISOString(), taskId, 4).run();
-        stepResults[4] = await executeStep4(context, stepResults[1], stepResults[3]);
-      }
-    }
-
-    // Phase 2: 步骤 5-7（逐集生成）
-    const context2 = {
+    // 构建上下文
+    const buildContext = () => ({
       taskId,
       userId,
       input,
       provider,
       db: c.env.DB,
       totalEpisodes: task.total_episodes as number,
-      onStepComplete: async () => {},
-      onEpisodeComplete: async (episodeNumber: number, total: number) => {
+      onStepComplete: async (step: number, name: string, data: any) => {
+        stepResults[step] = data;
         await c.env.DB.prepare(
-          'UPDATE generation_tasks SET completed_episodes = ?, updated_at = ? WHERE id = ?'
-        ).bind(episodeNumber, new Date().toISOString(), taskId).run();
+          'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
+        ).bind(JSON.stringify(data), 'completed', new Date().toISOString(), taskId, step).run();
+        await c.env.DB.prepare(
+          'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ? AND status = ?'
+        ).bind('running', new Date().toISOString(), taskId, step + 1, 'pending').run();
+        await c.env.DB.prepare(
+          'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
+        ).bind(step, new Date().toISOString(), taskId).run();
       },
+      onEpisodeComplete: async () => {},
       onLog: (msg: string) => console.log(`[${taskId}] ${msg}`),
-    };
+      onError: async (step: number, name: string, error: string) => {
+        pendingErrors.push({ step, name, message: error });
+      },
+    });
 
-    await executePipelinePhase2(context2, stepResults[1], stepResults[2], stepResults[4]);
+    // Phase 1: 步骤 1-4 (每个步骤独立 try-catch)
+    if (currentStep < 4) {
+      const context = buildContext();
+
+      const STEP_CONFIG: { num: number; fn: () => Promise<any> }[] = [
+        { num: 1, fn: () => executeStep1(context) },
+        { num: 2, fn: () => executeStep2(context, stepResults[1]) },
+        { num: 3, fn: () => executeStep3(context, stepResults[1], stepResults[2]) },
+        { num: 4, fn: () => executeStep4(context, stepResults[1], stepResults[3]) },
+      ];
+
+      for (const { num, fn } of STEP_CONFIG) {
+        if (stepResults[num]) continue; // 已完成则跳过
+
+        // 检查任务是否被暂停
+        const taskStatus = await c.env.DB.prepare(
+          'SELECT status FROM generation_tasks WHERE id = ?'
+        ).bind(taskId).first();
+        if (taskStatus?.status === 'paused') {
+          console.log(`[${taskId}] 任务已暂停`);
+          return;
+        }
+
+        await c.env.DB.prepare(
+          'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
+        ).bind('running', new Date().toISOString(), taskId, num).run();
+
+        try {
+          stepResults[num] = await fn();
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[${taskId}] Step ${num} 失败:`, errMsg);
+
+          // 更新步骤状态为失败
+          await c.env.DB.prepare(
+            'UPDATE pipeline_steps SET status = ?, error_message = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
+          ).bind('failed', errMsg, new Date().toISOString(), taskId, num).run();
+
+          // 收集错误（不中断后续步骤，让stepResults留空以便重试）
+          pendingErrors.push({ step: num, name: STEP_NAMES[num], message: errMsg });
+        }
+      }
+    }
+
+    // 检查关键步骤是否完成（step1-4必须全部完成才能继续）
+    if (!stepResults[1] || !stepResults[2] || !stepResults[3] || !stepResults[4]) {
+      const failedSteps = [1,2,3,4].filter(n => !stepResults[n]);
+      await c.env.DB.prepare(
+        'UPDATE generation_tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?'
+      ).bind(
+        'failed',
+        `步骤 ${failedSteps.join(',')} 生成失败，请重试`,
+        new Date().toISOString(),
+        taskId
+      ).run();
+      return;
+    }
+
+    // Phase 2: 步骤 5-7（逐集生成）
+    const context2 = buildContext();
+
+    try {
+      await executePipelinePhase2(context2, stepResults[1], stepResults[2], stepResults[4]);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[${taskId}] Phase 2 失败:`, errMsg);
+      pendingErrors.push({ step: 5, name: 'scenes/dialogue/compose', message: errMsg });
+    }
 
     // Phase 3: 步骤 8（评分）
     await c.env.DB.prepare(
       'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
     ).bind('running', new Date().toISOString(), taskId, 8).run();
 
-    const score = await executePipelinePhase3(context2, stepResults[1]);
+    try {
+      const score = await executePipelinePhase3(context2, stepResults[1]);
 
-    if (score) {
-      await c.env.DB.prepare(`
-        INSERT INTO scores (task_id, plot_score, dialogue_score, character_score, pacing_score, creativity_score, overall_score, suggestions, evaluated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        taskId,
-        score.plot?.score || 0,
-        score.dialogue?.score || 0,
-        score.character?.score || 0,
-        score.pacing?.score || 0,
-        score.creativity?.score || 0,
-        score.overall || 0,
-        JSON.stringify(score.suggestions || []),
-        new Date().toISOString()
-      ).run();
+      if (score) {
+        await c.env.DB.prepare(
+          'INSERT INTO scores (task_id, plot_score, dialogue_score, character_score, pacing_score, creativity_score, overall_score, suggestions, evaluated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+          taskId,
+          score.plot?.score || 0, score.dialogue?.score || 0, score.character?.score || 0,
+          score.pacing?.score || 0, score.creativity?.score || 0, score.overall || 0,
+          JSON.stringify(score.suggestions || []), new Date().toISOString()
+        ).run();
 
+        await c.env.DB.prepare(
+          'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
+        ).bind(JSON.stringify(score), 'completed', new Date().toISOString(), taskId, 8).run();
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[${taskId}] Step 8 评分失败:`, errMsg);
+      pendingErrors.push({ step: 8, name: 'evaluate', message: errMsg });
       await c.env.DB.prepare(
-        'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
-      ).bind(JSON.stringify(score), 'completed', new Date().toISOString(), taskId, 8).run();
+        'UPDATE pipeline_steps SET status = ?, error_message = ? WHERE task_id = ? AND step_number = ?'
+      ).bind('failed', errMsg, taskId, 8).run();
     }
 
-    // 保存版本
+    // 标记任务完成（即使有部分非关键错误）
     await c.env.DB.prepare(
-      'UPDATE generation_tasks SET current_step = 8, status = ?, updated_at = ? WHERE id = ?'
-    ).bind('completed', new Date().toISOString(), taskId).run();
+      'UPDATE generation_tasks SET current_step = 8, status = ?, error_message = ?, updated_at = ? WHERE id = ?'
+    ).bind(
+      'completed',
+      pendingErrors.length > 0 ? JSON.stringify(pendingErrors) : null,
+      new Date().toISOString(),
+      taskId
+    ).run();
 
     // 创建初始版本
     const firstEpisode = await c.env.DB.prepare(
@@ -684,18 +778,16 @@ async function runPipeline(
     ).bind(taskId).first();
 
     if (firstEpisode) {
-      await c.env.DB.prepare(`
-        INSERT INTO script_versions (task_id, version, label, content, created_at)
-        VALUES (?, 1, '初稿', ?, ?)
-      `).bind(taskId, firstEpisode.content, new Date().toISOString()).run();
+      await c.env.DB.prepare(
+        'INSERT INTO script_versions (task_id, version, label, content, created_at) VALUES (?, 1, ?, ?, ?)'
+      ).bind(taskId, '初稿', firstEpisode.content, new Date().toISOString()).run();
     }
 
-    console.log(`[${taskId}] 流水线完成`);
+    console.log(`[${taskId}] 流水线完成 (${pendingErrors.length} 个警告)`);
 
   } catch (error) {
     console.error(`[${taskId}] 流水线错误:`, error);
 
-    // 检查是否是暂停导致的中断
     const task = await c.env.DB.prepare(
       'SELECT status FROM generation_tasks WHERE id = ?'
     ).bind(taskId).first();
@@ -705,7 +797,6 @@ async function runPipeline(
       return;
     }
 
-    // 标记失败
     await c.env.DB.prepare(
       'UPDATE generation_tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?'
     ).bind('failed', (error as Error).message, new Date().toISOString(), taskId).run();
@@ -747,7 +838,7 @@ async function pushSSEUpdates(
     });
   }
 
-  // 轮询推送更新（每2秒检查一次）
+  // 推送更新（每2秒检查一次）
   const interval = setInterval(async () => {
     try {
       const currentTask = await c.env.DB.prepare(
@@ -781,6 +872,32 @@ async function pushSSEUpdates(
           episodeNumber: latestEpisode.episode_number,
           title: latestEpisode.title,
           contentPreview: (latestEpisode.content as string)?.substring(0, 200) || '',
+        });
+      }
+
+      // 推送错误日志（失败的步骤）
+      const failedSteps = await c.env.DB.prepare(
+        'SELECT step_number, step_name, error_message FROM pipeline_steps WHERE task_id = ? AND status = ? AND error_message IS NOT NULL'
+      ).bind(taskId, 'failed').all();
+
+      if (failedSteps.results?.length) {
+        for (const step of failedSteps.results) {
+          await send('error', {
+            step: step.step_number,
+            stepName: step.step_name,
+            message: step.error_message,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
+      // 推送任务级别的错误
+      if (currentTask.error_message) {
+        await send('error', {
+          step: 0,
+          stepName: 'task',
+          message: currentTask.error_message,
+          timestamp: new Date().toISOString(),
         });
       }
 
