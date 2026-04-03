@@ -52,6 +52,45 @@ function generateTaskId(): string {
   return `task_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
+async function getFullTaskMarkdown(db: D1Database, taskId: string): Promise<string> {
+  const task = await db.prepare(
+    'SELECT * FROM generation_tasks WHERE id = ?'
+  ).bind(taskId).first();
+
+  if (!task) {
+    throw new Error('任务不存在');
+  }
+
+  const episodes = await db.prepare(
+    'SELECT * FROM episodes WHERE task_id = ? ORDER BY episode_number'
+  ).bind(taskId).all();
+
+  if (!episodes.results?.length) {
+    throw new Error('暂无已生成的集数');
+  }
+
+  const outlineStep = await db.prepare(
+    'SELECT content FROM pipeline_steps WHERE task_id = ? AND step_number = 1'
+  ).bind(taskId).first();
+
+  const outline = outlineStep?.content ? JSON.parse(outlineStep.content as string) : {};
+
+  let markdown = `# ${task.title}\n\n`;
+  markdown += `> **题材**: ${task.genre} | **类型**: ${task.script_type} | **总集数**: ${task.total_episodes}\n\n`;
+
+  if (outline.synopsis) {
+    markdown += `## 故事梗概\n\n${outline.synopsis}\n\n`;
+  }
+
+  markdown += `---\n\n`;
+
+  for (const ep of episodes.results) {
+    markdown += `${ep.content}\n\n---\n\n`;
+  }
+
+  return markdown;
+}
+
 /**
  * POST /api/pipeline/start
  * 创建新的生成任务并开始流水线
@@ -418,32 +457,7 @@ pipelineRoutes.get('/:id/export', jwtAuth, async (c) => {
       return c.json({ success: false, error: '任务不存在' }, 404);
     }
 
-    const episodes = await c.env.DB.prepare(
-      'SELECT * FROM episodes WHERE task_id = ? ORDER BY episode_number'
-    ).bind(taskId).all();
-
-    if (!episodes.results?.length) {
-      return c.json({ success: false, error: '暂无已生成的集数' }, 400);
-    }
-
-    // 获取故事大纲
-    const outlineStep = await c.env.DB.prepare(
-      'SELECT content FROM pipeline_steps WHERE task_id = ? AND step_number = 1'
-    ).bind(taskId).first();
-
-    const outline = outlineStep?.content ? JSON.parse(outlineStep.content as string) : {};
-
-    // 组装完整Markdown
-    let markdown = `# ${task.title}\n\n`;
-    markdown += `> **题材**: ${task.genre} | **类型**: ${task.script_type} | **总集数**: ${task.total_episodes}\n\n`;
-    if (outline.synopsis) {
-      markdown += `## 故事梗概\n\n${outline.synopsis}\n\n`;
-    }
-    markdown += `---\n\n`;
-
-    for (const ep of episodes.results) {
-      markdown += `${ep.content}\n\n---\n\n`;
-    }
+    const markdown = await getFullTaskMarkdown(c.env.DB, taskId);
 
     if (format === 'markdown') {
       return new Response(markdown, {
@@ -462,6 +476,136 @@ pipelineRoutes.get('/:id/export', jwtAuth, async (c) => {
   } catch (error) {
     console.error('导出剧本错误:', error);
     return c.json({ success: false, error: '导出失败' }, 500);
+  }
+});
+
+/**
+ * GET /api/pipeline/:id/versions
+ * 获取任务版本列表
+ */
+pipelineRoutes.get('/:id/versions', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id');
+
+    const task = await c.env.DB.prepare(
+      'SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?'
+    ).bind(taskId, payload.userId).first();
+
+    if (!task) {
+      return c.json({ success: false, error: '任务不存在' }, 404);
+    }
+
+    const versions = await c.env.DB.prepare(`
+      SELECT id, task_id, version, label, change_notes, created_at
+      FROM script_versions
+      WHERE task_id = ?
+      ORDER BY version DESC, created_at DESC
+    `).bind(taskId).all();
+
+    return c.json({
+      success: true,
+      data: { versions: versions.results || [] },
+    });
+  } catch (error) {
+    console.error('获取版本列表错误:', error);
+    return c.json({ success: false, error: '获取版本列表失败' }, 500);
+  }
+});
+
+/**
+ * GET /api/pipeline/:id/versions/:versionId
+ * 获取单个版本详情
+ */
+pipelineRoutes.get('/:id/versions/:versionId', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id');
+    const versionId = c.req.param('versionId');
+
+    const task = await c.env.DB.prepare(
+      'SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?'
+    ).bind(taskId, payload.userId).first();
+
+    if (!task) {
+      return c.json({ success: false, error: '任务不存在' }, 404);
+    }
+
+    const version = await c.env.DB.prepare(`
+      SELECT id, task_id, version, label, content, change_notes, created_at
+      FROM script_versions
+      WHERE id = ? AND task_id = ?
+    `).bind(versionId, taskId).first();
+
+    if (!version) {
+      return c.json({ success: false, error: '版本不存在' }, 404);
+    }
+
+    return c.json({
+      success: true,
+      data: { version },
+    });
+  } catch (error) {
+    console.error('获取版本详情错误:', error);
+    return c.json({ success: false, error: '获取版本详情失败' }, 500);
+  }
+});
+
+/**
+ * POST /api/pipeline/:id/versions
+ * 创建任务版本快照
+ */
+pipelineRoutes.post('/:id/versions', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id');
+    const body = await c.req.json().catch(() => ({}));
+    const label = typeof body.label === 'string' ? body.label.trim() : '';
+    const changeNotes = typeof body.changeNotes === 'string' ? body.changeNotes.trim() : '';
+
+    const task = await c.env.DB.prepare(
+      'SELECT id, title FROM generation_tasks WHERE id = ? AND user_id = ?'
+    ).bind(taskId, payload.userId).first();
+
+    if (!task) {
+      return c.json({ success: false, error: '任务不存在' }, 404);
+    }
+
+    const markdown = await getFullTaskMarkdown(c.env.DB, taskId);
+
+    const latestVersion = await c.env.DB.prepare(
+      'SELECT version FROM script_versions WHERE task_id = ? ORDER BY version DESC LIMIT 1'
+    ).bind(taskId).first();
+
+    const nextVersion = Number(latestVersion?.version || 0) + 1;
+    const finalLabel = label || `版本 ${nextVersion}`;
+
+    const result = await c.env.DB.prepare(`
+      INSERT INTO script_versions (task_id, version, label, content, change_notes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      taskId,
+      nextVersion,
+      finalLabel,
+      markdown,
+      changeNotes || null,
+      new Date().toISOString()
+    ).run();
+
+    const version = await c.env.DB.prepare(`
+      SELECT id, task_id, version, label, content, change_notes, created_at
+      FROM script_versions
+      WHERE id = ?
+    `).bind(result.meta.last_row_id).first();
+
+    return c.json({
+      success: true,
+      message: '版本快照已创建',
+      data: { version },
+    });
+  } catch (error) {
+    console.error('创建版本快照错误:', error);
+    return c.json({ success: false, error: error instanceof Error ? error.message : '创建版本失败' }, 500);
   }
 });
 
@@ -773,14 +917,12 @@ async function runPipeline(
     ).run();
 
     // 创建初始版本
-    const firstEpisode = await c.env.DB.prepare(
-      'SELECT content FROM episodes WHERE task_id = ? ORDER BY episode_number LIMIT 1'
-    ).bind(taskId).first();
+    const fullMarkdown = await getFullTaskMarkdown(c.env.DB, taskId).catch(() => null);
 
-    if (firstEpisode) {
+    if (fullMarkdown) {
       await c.env.DB.prepare(
         'INSERT INTO script_versions (task_id, version, label, content, created_at) VALUES (?, 1, ?, ?, ?)'
-      ).bind(taskId, '初稿', firstEpisode.content, new Date().toISOString()).run();
+      ).bind(taskId, '初稿', fullMarkdown, new Date().toISOString()).run();
     }
 
     console.log(`[${taskId}] 流水线完成 (${pendingErrors.length} 个警告)`);
