@@ -217,6 +217,10 @@ async function broadcastTransientLog(taskId: string, entry: PipelineLogEntry): P
   });
 }
 
+function shouldPersistLiveLog(entry: PipelineLogEntry): boolean {
+  return entry.message.startsWith('[AI Input]') || entry.message.startsWith('[AI Output]');
+}
+
 function buildProgressPayload(taskId: string, task: any) {
   return {
     taskId,
@@ -1198,6 +1202,12 @@ async function runPipeline(
         await broadcastPipelineLog(taskId, log);
       },
       onLiveLog: async (entry: PipelineLogEntry) => {
+        if (shouldPersistLiveLog(entry)) {
+          const log = await appendPipelineLog(c.env.DB, taskId, entry);
+          await broadcastPipelineLog(taskId, log);
+          return;
+        }
+
         await broadcastTransientLog(taskId, entry);
       },
       onError: async (step: number, name: string, error: string) => {
