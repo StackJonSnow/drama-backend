@@ -2,7 +2,8 @@ import { Hono } from 'hono';
 import { sign, verify } from 'hono/jwt';
 import type { Context, Next } from 'hono';
 import { AIServiceAccessError, ensureServiceReadyForGeneration } from '../services/ai-access';
-import { getUserAIProvider } from '../services/ai-provider';
+import { getUserAIConfigSnapshot, getUserAIProvider } from '../services/ai-provider';
+import { getAIServiceDefinition } from '../services/ai-catalog';
 import {
   executePipelinePhase1,
   executePipelinePhase2,
@@ -233,6 +234,31 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+async function resolveTaskAISelection(
+  userId: number,
+  env: { AI: any; DB: D1Database },
+  serviceName = 'cloudflare-ai',
+  requestedModel?: string,
+): Promise<{ serviceName: string; model: string | null }> {
+  const definition = getAIServiceDefinition(serviceName);
+
+  if (!definition) {
+    throw new Error('不支持的 AI 渠道');
+  }
+
+  if (serviceName !== 'cloudflare-ai') {
+    await ensureServiceReadyForGeneration(env.DB, userId, serviceName);
+  }
+
+  const snapshot = await getUserAIConfigSnapshot(userId, env, serviceName);
+  const resolvedModel = requestedModel?.trim() || snapshot.model || definition.defaultModel || null;
+
+  return {
+    serviceName,
+    model: resolvedModel,
+  };
+}
+
 async function getFullTaskMarkdown(db: D1Database, taskId: string): Promise<string> {
   const task = await db.prepare(
     'SELECT * FROM generation_tasks WHERE id = ?'
@@ -291,7 +317,11 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       return c.json({ success: false, error: '标题、题材和剧本类型是必填项' }, 400);
     }
 
-    await ensureServiceReadyForGeneration(c.env.DB, payload.userId, ai_service || 'cloudflare-ai');
+    const aiSelection = await resolveTaskAISelection(
+      payload.userId,
+      c.env,
+      ai_service || 'cloudflare-ai',
+    );
 
     const taskId = generateTaskId();
     const now = new Date().toISOString();
@@ -301,8 +331,8 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       INSERT INTO generation_tasks (
         id, user_id, title, genre, script_type, style, target_platform,
         target_duration, character_count, key_points, characters_input,
-        scene_input, ai_service, total_episodes, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+        scene_input, ai_service, ai_model, total_episodes, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
     `).bind(
       taskId,
       payload.userId,
@@ -316,7 +346,8 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       key_points ? JSON.stringify(key_points) : null,
       characters_input ? JSON.stringify(characters_input) : null,
       scene_input || null,
-      ai_service || 'cloudflare-ai',
+      aiSelection.serviceName,
+      aiSelection.model,
       total_episodes || 50,
       now
     ).run();
@@ -327,6 +358,14 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
         'INSERT INTO pipeline_steps (task_id, step_number, step_name, status) VALUES (?, ?, ?, ?)'
       ).bind(taskId, i, STEP_NAMES[i], i === 1 ? 'running' : 'pending').run();
     }
+
+    await appendPipelineLog(c.env.DB, taskId, {
+      level: 'info',
+      stepNumber: 1,
+      stepName: STEP_NAMES[1],
+      message: '任务已启动',
+      detail: `渠道=${aiSelection.serviceName}，模型=${aiSelection.model || 'default'}`,
+    });
 
     // 使用 waitUntil 在后台执行流水线（不阻塞响应）
     c.executionCtx.waitUntil(
@@ -441,6 +480,9 @@ pipelineRoutes.post('/:id/resume', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const taskId = c.req.param('id') || '';
+    const body = await c.req.json().catch(() => ({}));
+    const requestedServiceName = typeof body.ai_service === 'string' ? body.ai_service : undefined;
+    const requestedModel = typeof body.ai_model === 'string' ? body.ai_model : undefined;
 
     const task = await c.env.DB.prepare(
       'SELECT * FROM generation_tasks WHERE id = ? AND user_id = ?'
@@ -454,9 +496,25 @@ pipelineRoutes.post('/:id/resume', jwtAuth, async (c) => {
       return c.json({ success: false, error: '只有暂停的任务可以恢复' }, 400);
     }
 
+    const aiSelection = await resolveTaskAISelection(
+      payload.userId,
+      c.env,
+      requestedServiceName || (task.ai_service as string) || 'cloudflare-ai',
+      requestedModel || (task.ai_model as string | undefined),
+    );
+
     await c.env.DB.prepare(
-      'UPDATE generation_tasks SET status = ?, updated_at = ? WHERE id = ?'
-    ).bind('running', new Date().toISOString(), taskId).run();
+      'UPDATE generation_tasks SET status = ?, ai_service = ?, ai_model = ?, updated_at = ? WHERE id = ?'
+    ).bind('running', aiSelection.serviceName, aiSelection.model, new Date().toISOString(), taskId).run();
+
+    const resumeLog = await appendPipelineLog(c.env.DB, taskId, {
+      level: 'info',
+      stepNumber: task.current_step as number,
+      stepName: STEP_NAMES[task.current_step as number],
+      message: '任务已恢复',
+      detail: `渠道=${aiSelection.serviceName}，模型=${aiSelection.model || 'default'}`,
+    });
+    await broadcastPipelineLog(taskId, resumeLog);
 
     // 重新启动流水线
     c.executionCtx.waitUntil(
@@ -466,6 +524,10 @@ pipelineRoutes.post('/:id/resume', jwtAuth, async (c) => {
     return c.json({
       success: true,
       message: '任务已恢复',
+      data: {
+        ai_service: aiSelection.serviceName,
+        ai_model: aiSelection.model,
+      },
     });
 
   } catch (error) {
@@ -1036,7 +1098,9 @@ async function runPipeline(
     // 获取AI Provider
     await ensureServiceReadyForGeneration(c.env.DB, userId, task.ai_service as string);
 
-    const provider = await getUserAIProvider(userId, c.env, task.ai_service as string);
+    const provider = await getUserAIProvider(userId, c.env, task.ai_service as string, {
+      model: task.ai_model as string | undefined,
+    });
 
     const input: TaskInput = {
       title: task.title as string,

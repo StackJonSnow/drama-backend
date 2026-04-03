@@ -118,14 +118,15 @@ async function callAI(
     ];
 
     const startedAt = Date.now();
+    const activeModel = provider.model || 'default';
 
     await context.onLog?.({
       level: 'info',
       stepNumber: options.stepNumber,
       stepName: options.stepName,
       episodeNumber: options.episodeNumber,
-      message: `[AI] 请求 ${provider.name} · 尝试 ${attempt}${compressed ? '（压缩上下文）' : ''}`,
-      detail: `system=${currentSystem.length} chars, user=${currentUser.length} chars, jsonMode=${jsonMode}`,
+      message: `[AI] 请求 ${provider.name}/${activeModel} · 尝试 ${attempt}${compressed ? '（压缩上下文）' : ''}`,
+      detail: `model=${activeModel}, system=${currentSystem.length} chars, user=${currentUser.length} chars, jsonMode=${jsonMode}`,
     });
 
     await context.onLiveLog?.({
@@ -133,7 +134,7 @@ async function callAI(
       stepNumber: options.stepNumber,
       stepName: options.stepName,
       episodeNumber: options.episodeNumber,
-      message: `[AI Input] ${provider.name} · 尝试 ${attempt}${compressed ? '（压缩上下文）' : ''}`,
+      message: `[AI Input] ${provider.name}/${activeModel} · 尝试 ${attempt}${compressed ? '（压缩上下文）' : ''}`,
       detail: `[System]\n${currentSystem}\n\n[User]\n${currentUser}`,
     });
 
@@ -146,8 +147,8 @@ async function callAI(
           stepNumber: options.stepNumber,
           stepName: options.stepName,
           episodeNumber: options.episodeNumber,
-          message: `[AI] ${provider.name} 仍在响应中`,
-          detail: `已等待 ${Math.floor((Date.now() - startedAt) / 1000)} 秒`,
+          message: `[AI] ${provider.name}/${activeModel} 仍在响应中`,
+          detail: `模型=${activeModel}，已等待 ${Math.floor((Date.now() - startedAt) / 1000)} 秒`,
         });
       }, 15000);
 
@@ -188,7 +189,7 @@ async function callAI(
         stepNumber: options.stepNumber,
         stepName: options.stepName,
         episodeNumber: options.episodeNumber,
-        message: `[AI Output] ${provider.name}`,
+        message: `[AI Output] ${provider.name}/${activeModel}`,
         detail: `[Meta]\n耗时: ${elapsedMs}ms\n${usage}\n\n[Content]\n${response.content}`,
       });
 
