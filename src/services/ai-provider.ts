@@ -10,6 +10,8 @@ export interface AIRequestOptions {
   maxTokens?: number;
   temperature?: number;
   jsonMode?: boolean;
+  signal?: AbortSignal;
+  onChunk?: (chunk: string) => void | Promise<void>;
 }
 
 export interface AIResponse {
@@ -103,18 +105,28 @@ export class OpenAICompatibleProvider implements AIProvider {
       body.response_format = { type: 'json_object' };
     }
 
+    if (options?.onChunk) {
+      body.stream = true;
+      body.stream_options = { include_usage: true };
+    }
+
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.apiKey}`,
       },
+      signal: options?.signal,
       body: JSON.stringify(body),
     });
 
     if (!response.ok) {
       const err = await response.text();
       throw new Error(`${this.name} API error: ${response.status} - ${err}`);
+    }
+
+    if (options?.onChunk && response.body) {
+      return this.readStreamingResponse(response, options.onChunk);
     }
 
     const data: any = await response.json();
@@ -127,6 +139,63 @@ export class OpenAICompatibleProvider implements AIProvider {
         totalTokens: data.usage.total_tokens,
       } : undefined,
     };
+  }
+
+  private async readStreamingResponse(response: Response, onChunk: (chunk: string) => void | Promise<void>): Promise<AIResponse> {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error(`${this.name} API error: response body is not readable`);
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let content = '';
+    let usage: AIResponse['usage'];
+
+    const processLine = async (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+
+      const data = JSON.parse(payload);
+      const delta = data.choices?.[0]?.delta?.content;
+      if (typeof delta === 'string' && delta.length > 0) {
+        content += delta;
+        await onChunk(delta);
+      }
+
+      if (data.usage) {
+        usage = {
+          promptTokens: data.usage.prompt_tokens || 0,
+          completionTokens: data.usage.completion_tokens || 0,
+          totalTokens: data.usage.total_tokens || 0,
+        };
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        await processLine(line);
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      for (const line of buffer.split('\n')) {
+        await processLine(line);
+      }
+    }
+
+    return { content, usage };
   }
 }
 
@@ -170,6 +239,7 @@ export class ClaudeProvider implements AIProvider {
         'x-api-key': this.apiKey,
         'anthropic-version': '2023-06-01',
       },
+      signal: options?.signal,
       body: JSON.stringify(body),
     });
 
