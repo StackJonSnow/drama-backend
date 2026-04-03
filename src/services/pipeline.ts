@@ -26,8 +26,17 @@ export interface PipelineContext {
   abortSignal?: AbortSignal;
   onStepComplete?: (step: number, name: string, data: any) => Promise<void>;
   onEpisodeComplete?: (episodeNumber: number, total: number) => Promise<void>;
-  onLog?: (message: string) => void;
+  onLog?: (entry: PipelineLogEntry) => Promise<void> | void;
   onError?: (step: number, stepName: string, error: string) => Promise<void>;
+}
+
+export interface PipelineLogEntry {
+  level?: 'info' | 'success' | 'warning' | 'error';
+  stepNumber?: number;
+  stepName?: string;
+  episodeNumber?: number;
+  message: string;
+  detail?: string;
 }
 
 export type PipelineStepResult = {
@@ -85,48 +94,149 @@ async function callAI(
   systemMsg: string,
   userMsg: string,
   context: PipelineContext,
-  jsonMode = true,
-  timeoutMs = 120000
-): Promise<any> {
-  const messages = [
-    { role: 'system' as const, content: systemMsg },
-    { role: 'user' as const, content: userMsg },
-  ];
-
-  context.onLog?.(`[AI] 正在调用 ${provider.name}...`);
-
-  const aiPromise = provider.chat(messages, {
-    maxTokens: 8192,
-    temperature: 0.7,
-    jsonMode: jsonMode && provider.name === 'openai',
-  });
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
-    }, timeoutMs);
-    context.abortSignal?.addEventListener('abort', () => {
-      clearTimeout(timer);
-      reject(new Error('PIPELINE_ABORTED'));
-    }, { once: true });
-  });
-
-  const response = await Promise.race([aiPromise, timeoutPromise]);
-
-  const preview = response.content.substring(0, 200).replace(/\n/g, ' ');
-  context.onLog?.(`[AI] 收到响应 ${response.content.length}字 | ${preview}...`);
-
-  if (jsonMode) {
-    try {
-      return parseJsonResponse(response.content);
-    } catch (parseErr) {
-      context.onLog?.(`[AI] JSON解析失败，尝试截取有效部分...`);
-      const extracted = extractJson(response.content);
-      if (extracted) return extracted;
-      throw parseErr;
-    }
+  options: {
+    jsonMode?: boolean;
+    timeoutMs?: number;
+    stepNumber: number;
+    stepName: string;
+    episodeNumber?: number;
   }
-  return response.content;
+): Promise<any> {
+  const jsonMode = options.jsonMode ?? true;
+  const timeoutMs = options.timeoutMs ?? 120000;
+
+  const runAttempt = async (attempt: number, compressed: boolean, currentSystem: string, currentUser: string): Promise<any> => {
+    const messages = [
+      { role: 'system' as const, content: currentSystem },
+      { role: 'user' as const, content: currentUser },
+    ];
+
+    await context.onLog?.({
+      level: 'info',
+      stepNumber: options.stepNumber,
+      stepName: options.stepName,
+      episodeNumber: options.episodeNumber,
+      message: `[AI] 请求 ${provider.name} · 尝试 ${attempt}${compressed ? '（压缩上下文）' : ''}`,
+      detail: `system=${currentSystem.length} chars, user=${currentUser.length} chars, jsonMode=${jsonMode}`,
+    });
+
+    try {
+      const aiPromise = provider.chat(messages, {
+        maxTokens: compressed ? 4096 : 8192,
+        temperature: 0.7,
+        jsonMode,
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
+        }, timeoutMs);
+        context.abortSignal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new Error('PIPELINE_ABORTED'));
+        }, { once: true });
+      });
+
+      const response = await Promise.race([aiPromise, timeoutPromise]);
+      const usage = response.usage
+        ? `tokens=${response.usage.totalTokens} (prompt=${response.usage.promptTokens}, completion=${response.usage.completionTokens})`
+        : 'tokens=unknown';
+      const preview = response.content.substring(0, 280).replace(/\n/g, ' ');
+
+      await context.onLog?.({
+        level: 'success',
+        stepNumber: options.stepNumber,
+        stepName: options.stepName,
+        episodeNumber: options.episodeNumber,
+        message: `[AI] 响应成功 · ${response.content.length} chars · ${usage}`,
+        detail: preview,
+      });
+
+      if (jsonMode) {
+        try {
+          return parseJsonResponse(response.content);
+        } catch (parseErr) {
+          await context.onLog?.({
+            level: 'warning',
+            stepNumber: options.stepNumber,
+            stepName: options.stepName,
+            episodeNumber: options.episodeNumber,
+            message: '[AI] JSON解析失败，尝试提取可恢复片段',
+            detail: parseErr instanceof Error ? parseErr.message : String(parseErr),
+          });
+          const extracted = extractJson(response.content);
+          if (extracted) return extracted;
+          throw parseErr;
+        }
+      }
+
+      return response.content;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      if (errorMessage === 'PIPELINE_ABORTED') {
+        throw error;
+      }
+
+      await context.onLog?.({
+        level: 'error',
+        stepNumber: options.stepNumber,
+        stepName: options.stepName,
+        episodeNumber: options.episodeNumber,
+        message: `[AI] 调用失败 · 尝试 ${attempt}`,
+        detail: errorMessage,
+      });
+
+      const normalized = errorMessage.toLowerCase();
+      const shouldRetry = attempt < 2 && (
+        normalized.includes('context')
+        || normalized.includes('token')
+        || normalized.includes('too long')
+        || normalized.includes('maximum')
+        || normalized.includes('rate limit')
+        || normalized.includes('timeout')
+        || normalized.includes('overloaded')
+        || normalized.includes('502')
+        || normalized.includes('503')
+        || normalized.includes('504')
+      );
+
+      if (!shouldRetry) {
+        throw error;
+      }
+
+      const compressedSystem = compressPrompt(currentSystem, 3000, 'system');
+      const compressedUser = compressPrompt(currentUser, 12000, 'user');
+
+      await context.onLog?.({
+        level: 'warning',
+        stepNumber: options.stepNumber,
+        stepName: options.stepName,
+        episodeNumber: options.episodeNumber,
+        message: '[AI] 检测到模型调用失败或上下文过长，已压缩上下文后自动重试',
+        detail: `system=${compressedSystem.length} chars, user=${compressedUser.length} chars`,
+      });
+
+      return runAttempt(attempt + 1, true, compressedSystem, compressedUser);
+    }
+  };
+
+  return runAttempt(1, false, systemMsg, userMsg);
+}
+
+function compressPrompt(content: string, maxLength: number, label: string): string {
+  if (content.length <= maxLength) return content;
+
+  const headLength = Math.floor(maxLength * 0.65);
+  const tailLength = Math.max(0, maxLength - headLength - 120);
+
+  return [
+    content.slice(0, headLength),
+    '',
+    `[${label} context compressed: removed ${content.length - headLength - tailLength} chars for retry]`,
+    '',
+    content.slice(content.length - tailLength),
+  ].join('\n');
 }
 
 function extractJson(text: string): any | null {
@@ -150,7 +260,13 @@ async function recordStepError(
   error: unknown
 ): Promise<void> {
   const errorMessage = error instanceof Error ? error.message : String(error);
-  context.onLog?.(`[Step ${stepNumber}] 错误: ${errorMessage}`);
+  await context.onLog?.({
+    level: 'error',
+    stepNumber,
+    stepName,
+    message: `[Step ${stepNumber}] 错误`,
+    detail: errorMessage,
+  });
 
   // 更新步骤状态为失败
   try {
@@ -182,9 +298,9 @@ function checkAbort(context: PipelineContext): void {
  * Step 1: 生成故事大纲
  */
 export async function executeStep1(context: PipelineContext): Promise<any> {
-  context.onLog?.('[Step 1] 生成故事大纲...');
+  await context.onLog?.({ level: 'info', stepNumber: 1, stepName: 'story_outline', message: '[Step 1] 生成故事大纲' });
   const prompt = storyOutlinePrompt(context.input);
-  const result = await callAI(context.provider, prompt.system, prompt.user, context);
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 1, stepName: 'story_outline' });
   await context.onStepComplete?.(1, 'story_outline', result);
   return result;
 }
@@ -194,9 +310,9 @@ export async function executeStep1(context: PipelineContext): Promise<any> {
  */
 export async function executeStep2(context: PipelineContext, storyOutline: any): Promise<any> {
   checkAbort(context);
-  context.onLog?.('[Step 2] 生成角色设定...');
+  await context.onLog?.({ level: 'info', stepNumber: 2, stepName: 'characters', message: '[Step 2] 生成角色设定' });
   const prompt = characterGenerationPrompt(context.input, storyOutline);
-  const result = await callAI(context.provider, prompt.system, prompt.user, context);
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 2, stepName: 'characters' });
   await context.onStepComplete?.(2, 'characters', result);
   return result;
 }
@@ -206,9 +322,9 @@ export async function executeStep2(context: PipelineContext, storyOutline: any):
  */
 export async function executeStep3(context: PipelineContext, storyOutline: any, characters: any): Promise<any> {
   checkAbort(context);
-  context.onLog?.('[Step 3] 生成剧情结构...');
+  await context.onLog?.({ level: 'info', stepNumber: 3, stepName: 'plot_structure', message: '[Step 3] 生成剧情结构' });
   const prompt = plotStructurePrompt(context.input, storyOutline, characters);
-  const result = await callAI(context.provider, prompt.system, prompt.user, context);
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 3, stepName: 'plot_structure' });
   await context.onStepComplete?.(3, 'plot_structure', result);
   return result;
 }
@@ -222,9 +338,9 @@ export async function executeStep4(
   plotStructure: any
 ): Promise<any> {
   checkAbort(context);
-  context.onLog?.('[Step 4] 生成集数拆分计划...');
+  await context.onLog?.({ level: 'info', stepNumber: 4, stepName: 'episode_plan', message: '[Step 4] 生成集数拆分计划' });
   const prompt = episodePlanningPrompt(context.input, storyOutline, plotStructure, context.totalEpisodes);
-  const result = await callAI(context.provider, prompt.system, prompt.user, context);
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 4, stepName: 'episode_plan' });
   await context.onStepComplete?.(4, 'episode_plan', result);
   return result;
 }
@@ -260,44 +376,95 @@ export async function executeStep5To7(
 
     // 跳过已完成的集数
     if (completedNumbers.has(episode.episodeNumber)) {
-      context.onLog?.(`[Step 5-7] 第${episode.episodeNumber}集已完成，跳过`);
+      await context.onLog?.({
+        level: 'info',
+        stepNumber: 5,
+        stepName: 'scenes',
+        episodeNumber: episode.episodeNumber,
+        message: `[Step 5-7] 第${episode.episodeNumber}集已完成，跳过`,
+      });
       completedEpisodes.push(episode);
       continue;
     }
 
-    context.onLog?.(`[Step 5-7] 生成第${episode.episodeNumber}集 (${episodes.length}集总量)...`);
+    await context.onLog?.({
+      level: 'info',
+      stepNumber: 5,
+      stepName: 'scenes',
+      episodeNumber: episode.episodeNumber,
+      message: `[Step 5-7] 开始生成第${episode.episodeNumber}集 / 共${episodes.length}集`,
+    });
 
-    // Step 5: 场景生成
-    context.onLog?.(`[Step 5] 第${episode.episodeNumber}集 - 场景生成`);
+    await context.db.prepare(
+      'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
+    ).bind(5, new Date().toISOString(), context.taskId).run();
+    await context.db.prepare(
+      `UPDATE pipeline_steps
+       SET status = CASE WHEN step_number = 5 THEN 'running' ELSE 'pending' END,
+           started_at = CASE WHEN step_number = 5 THEN ? ELSE started_at END,
+           completed_at = CASE WHEN step_number IN (6,7) THEN NULL ELSE completed_at END
+       WHERE task_id = ? AND step_number IN (5,6,7)`
+    ).bind(new Date().toISOString(), context.taskId).run();
+
     const scenePrompt = sceneGenerationPrompt(
       context.input, storyOutline, characters, episode,
       completedEpisodes.slice(-3)
     );
-    const scenes = await callAI(context.provider, scenePrompt.system, scenePrompt.user, context);
+    const scenes = await callAI(context.provider, scenePrompt.system, scenePrompt.user, context, {
+      stepNumber: 5,
+      stepName: 'scenes',
+      episodeNumber: episode.episodeNumber,
+    });
 
     checkAbort(context);
 
-    // Step 6: 对白生成
-    context.onLog?.(`[Step 6] 第${episode.episodeNumber}集 - 对白生成`);
+    await context.db.prepare(
+      'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
+    ).bind(6, new Date().toISOString(), context.taskId).run();
+    await context.db.prepare(
+      `UPDATE pipeline_steps
+       SET status = CASE WHEN step_number = 6 THEN 'running' ELSE 'pending' END,
+           started_at = CASE WHEN step_number = 6 THEN ? ELSE started_at END,
+           completed_at = CASE WHEN step_number IN (5,7) THEN NULL ELSE completed_at END
+       WHERE task_id = ? AND step_number IN (5,6,7)`
+    ).bind(new Date().toISOString(), context.taskId).run();
+
     const dialoguePrompt = dialogueGenerationPrompt(
       context.input, characters, episode, scenes.scenes || []
     );
-    const dialogues = await callAI(context.provider, dialoguePrompt.system, dialoguePrompt.user, context);
+    const dialogues = await callAI(context.provider, dialoguePrompt.system, dialoguePrompt.user, context, {
+      stepNumber: 6,
+      stepName: 'dialogue',
+      episodeNumber: episode.episodeNumber,
+    });
 
     checkAbort(context);
 
-    // Step 7: 剧本合成
-    context.onLog?.(`[Step 7] 第${episode.episodeNumber}集 - 剧本合成`);
+    await context.db.prepare(
+      'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
+    ).bind(7, new Date().toISOString(), context.taskId).run();
+    await context.db.prepare(
+      `UPDATE pipeline_steps
+       SET status = CASE WHEN step_number = 7 THEN 'running' ELSE 'pending' END,
+           started_at = CASE WHEN step_number = 7 THEN ? ELSE started_at END,
+           completed_at = CASE WHEN step_number IN (5,6) THEN NULL ELSE completed_at END
+       WHERE task_id = ? AND step_number IN (5,6,7)`
+    ).bind(new Date().toISOString(), context.taskId).run();
+
     const composePrompt = scriptCompositionPrompt(
       episode, scenes.scenes || [], dialogues.dialogues || []
     );
-    // 合成步骤不需要JSON模式
     const content = await callAI(
       context.provider,
       composePrompt.system,
       composePrompt.user,
       context,
-      false
+      {
+        jsonMode: false,
+        stepNumber: 7,
+        stepName: 'compose',
+        episodeNumber: episode.episodeNumber,
+      }
     );
 
     // 保存到DB
@@ -324,8 +491,20 @@ export async function executeStep5To7(
     ).bind(episode.episodeNumber, new Date().toISOString(), context.taskId).run();
 
     completedEpisodes.push(episode);
+    await context.onLog?.({
+      level: 'success',
+      stepNumber: 7,
+      stepName: 'compose',
+      episodeNumber: episode.episodeNumber,
+      message: `[Step 7] 第${episode.episodeNumber}集已完成并写入数据库`,
+      detail: `内容长度 ${content.length} chars`,
+    });
     await context.onEpisodeComplete?.(episode.episodeNumber, episodes.length);
   }
+
+  await context.db.prepare(
+    'UPDATE pipeline_steps SET status = ?, completed_at = ? WHERE task_id = ? AND step_number IN (5,6,7)'
+  ).bind('completed', new Date().toISOString(), context.taskId).run();
 }
 
 /**
@@ -333,7 +512,7 @@ export async function executeStep5To7(
  */
 export async function executeStep8(context: PipelineContext, storyOutline: any): Promise<any> {
   checkAbort(context);
-  context.onLog?.('[Step 8] 剧本评分...');
+  await context.onLog?.({ level: 'info', stepNumber: 8, stepName: 'evaluate', message: '[Step 8] 剧本评分' });
 
   // 获取第一集内容作为样本
   const sampleEpisode = await context.db.prepare(
@@ -341,12 +520,12 @@ export async function executeStep8(context: PipelineContext, storyOutline: any):
   ).bind(context.taskId).first();
 
   if (!sampleEpisode) {
-    context.onLog?.('[Step 8] 跳过评分（无已完成的集数）');
+    await context.onLog?.({ level: 'warning', stepNumber: 8, stepName: 'evaluate', message: '[Step 8] 跳过评分（无已完成的集数）' });
     return null;
   }
 
   const prompt = evaluationPrompt(context.input, storyOutline, sampleEpisode.content as string);
-  const result = await callAI(context.provider, prompt.system, prompt.user, context);
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 8, stepName: 'evaluate' });
   await context.onStepComplete?.(8, 'evaluate', result);
   return result;
 }

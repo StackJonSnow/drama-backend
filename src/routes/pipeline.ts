@@ -11,6 +11,7 @@ import {
   executeStep2,
   executeStep3,
   executeStep4,
+  type PipelineLogEntry,
   STEP_NAMES,
 } from '../services/pipeline';
 import type { TaskInput } from '../services/prompts';
@@ -28,6 +29,18 @@ type Variables = {
     email: string;
     exp: number;
   };
+};
+
+type PipelineLogRecord = {
+  id: number;
+  task_id: string;
+  level: 'info' | 'success' | 'warning' | 'error';
+  step_number: number | null;
+  step_name: string | null;
+  episode_number: number | null;
+  message: string;
+  detail: string | null;
+  created_at: string;
 };
 
 export const pipelineRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
@@ -51,6 +64,33 @@ async function jwtAuth(c: Context<{ Bindings: Bindings; Variables: Variables }>,
 // 生成任务ID
 function generateTaskId(): string {
   return `task_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+async function appendPipelineLog(
+  db: D1Database,
+  taskId: string,
+  entry: {
+    level?: 'info' | 'success' | 'warning' | 'error';
+    stepNumber?: number;
+    stepName?: string;
+    episodeNumber?: number;
+    message: string;
+    detail?: string;
+  },
+) {
+  await db.prepare(
+    `INSERT INTO pipeline_logs (task_id, level, step_number, step_name, episode_number, message, detail, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    taskId,
+    entry.level || 'info',
+    entry.stepNumber ?? null,
+    entry.stepName ?? null,
+    entry.episodeNumber ?? null,
+    entry.message,
+    entry.detail ?? null,
+    new Date().toISOString(),
+  ).run();
 }
 
 async function getFullTaskMarkdown(db: D1Database, taskId: string): Promise<string> {
@@ -762,6 +802,33 @@ pipelineRoutes.get('/:id/steps', jwtAuth, async (c) => {
   }
 });
 
+pipelineRoutes.get('/:id/logs', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id') || '';
+
+    const task = await c.env.DB.prepare(
+      'SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?'
+    ).bind(taskId, payload.userId).first();
+
+    if (!task) {
+      return c.json({ success: false, error: '任务不存在' }, 404);
+    }
+
+    const logs = await c.env.DB.prepare(
+      'SELECT id, task_id, level, step_number, step_name, episode_number, message, detail, created_at FROM pipeline_logs WHERE task_id = ? ORDER BY id ASC LIMIT 500'
+    ).bind(taskId).all();
+
+    return c.json({
+      success: true,
+      data: { logs: logs.results || [] },
+    });
+  } catch (error) {
+    console.error('获取流水线日志错误:', error);
+    return c.json({ success: false, error: '获取流水线日志失败' }, 500);
+  }
+});
+
 /**
  * GET /api/pipeline/:id/steps/:step/content
  * 获取单个步骤的生成内容（预览）
@@ -869,6 +936,12 @@ async function runPipeline(
       totalEpisodes: task.total_episodes as number,
       onStepComplete: async (step: number, name: string, data: any) => {
         stepResults[step] = data;
+        await appendPipelineLog(c.env.DB, taskId, {
+          level: 'success',
+          stepNumber: step,
+          stepName: name,
+          message: `步骤 ${step} 已完成`,
+        });
         await c.env.DB.prepare(
           'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
         ).bind(JSON.stringify(data), 'completed', new Date().toISOString(), taskId, step).run();
@@ -877,12 +950,29 @@ async function runPipeline(
         ).bind('running', new Date().toISOString(), taskId, step + 1, 'pending').run();
         await c.env.DB.prepare(
           'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
-        ).bind(step, new Date().toISOString(), taskId).run();
+        ).bind(Math.min(step + 1, 8), new Date().toISOString(), taskId).run();
       },
-      onEpisodeComplete: async () => {},
-      onLog: (msg: string) => console.log(`[${taskId}] ${msg}`),
+      onEpisodeComplete: async (episodeNumber: number, total: number) => {
+        await appendPipelineLog(c.env.DB, taskId, {
+          level: 'success',
+          stepNumber: 7,
+          stepName: 'compose',
+          episodeNumber,
+          message: `第${episodeNumber}/${total}集写作完成`,
+        });
+      },
+      onLog: async (entry: PipelineLogEntry) => {
+        await appendPipelineLog(c.env.DB, taskId, entry);
+      },
       onError: async (step: number, name: string, error: string) => {
         pendingErrors.push({ step, name, message: error });
+        await appendPipelineLog(c.env.DB, taskId, {
+          level: 'error',
+          stepNumber: step,
+          stepName: name,
+          message: `步骤 ${step} 执行失败`,
+          detail: error,
+        });
       },
     });
 
@@ -1060,6 +1150,8 @@ async function pushSSEUpdates(
     });
   }
 
+  let lastLogId = 0;
+
   // 推送更新（每2秒检查一次）
   const interval = setInterval(async () => {
     try {
@@ -1097,19 +1189,24 @@ async function pushSSEUpdates(
         });
       }
 
-      // 推送错误日志（失败的步骤）
-      const failedSteps = await c.env.DB.prepare(
-        'SELECT step_number, step_name, error_message FROM pipeline_steps WHERE task_id = ? AND status = ? AND error_message IS NOT NULL'
-      ).bind(taskId, 'failed').all();
+      const newLogs = await c.env.DB.prepare(
+        'SELECT id, task_id, level, step_number, step_name, episode_number, message, detail, created_at FROM pipeline_logs WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT 100'
+      ).bind(taskId, lastLogId).all();
 
-      if (failedSteps.results?.length) {
-        for (const step of failedSteps.results) {
-          await send('error', {
-            step: step.step_number,
-            stepName: step.step_name,
-            message: step.error_message,
-            timestamp: new Date().toISOString(),
+      if (newLogs.results?.length) {
+        for (const log of newLogs.results as PipelineLogRecord[]) {
+          await send(log.level === 'error' ? 'error' : 'log', {
+            id: log.id,
+            taskId: log.task_id,
+            level: log.level,
+            step: log.step_number,
+            stepName: log.step_name,
+            episodeNumber: log.episode_number,
+            message: log.message,
+            detail: log.detail,
+            timestamp: log.created_at,
           });
+          lastLogId = Math.max(lastLogId, log.id);
         }
       }
 
