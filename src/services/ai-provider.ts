@@ -1,7 +1,4 @@
-/**
- * AI提供商抽象层
- * 统一 Cloudflare Workers AI / OpenAI / Claude 接口
- */
+import { getAIServiceDefinition, normalizeBaseUrl } from './ai-catalog';
 
 export interface AIMessage {
   role: 'system' | 'user' | 'assistant';
@@ -12,7 +9,7 @@ export interface AIRequestOptions {
   model?: string;
   maxTokens?: number;
   temperature?: number;
-  jsonMode?: boolean;  // 强制JSON输出
+  jsonMode?: boolean;
 }
 
 export interface AIResponse {
@@ -29,19 +26,18 @@ export interface AIProvider {
   chat(messages: AIMessage[], options?: AIRequestOptions): Promise<AIResponse>;
 }
 
-// ============================================
-// Cloudflare Workers AI Provider
-// ============================================
 export class CloudflareAIProvider implements AIProvider {
   name = 'cloudflare-ai';
   private ai: any;
+  private model: string;
 
-  constructor(ai: any) {
+  constructor(ai: any, model = '@cf/meta/llama-3.1-8b-instruct') {
     this.ai = ai;
+    this.model = model;
   }
 
   async chat(messages: AIMessage[], options?: AIRequestOptions): Promise<AIResponse> {
-    const model = options?.model || '@cf/meta/llama-3.1-8b-instruct';
+    const model = options?.model || this.model;
 
     const cfMessages = messages.map(m => ({
       role: m.role,
@@ -65,19 +61,21 @@ export class CloudflareAIProvider implements AIProvider {
   }
 }
 
-// ============================================
-// OpenAI Provider
-// ============================================
-export class OpenAIProvider implements AIProvider {
-  name = 'openai';
+export class OpenAICompatibleProvider implements AIProvider {
+  name: string;
   private apiKey: string;
+  private baseUrl: string;
+  private model: string;
 
-  constructor(apiKey: string) {
+  constructor(serviceName: string, apiKey: string, baseUrl: string, model: string) {
+    this.name = serviceName;
     this.apiKey = apiKey;
+    this.baseUrl = normalizeBaseUrl(baseUrl);
+    this.model = model;
   }
 
   async chat(messages: AIMessage[], options?: AIRequestOptions): Promise<AIResponse> {
-    const model = options?.model || 'gpt-4o-mini';
+    const model = options?.model || this.model;
 
     const body: any = {
       model,
@@ -90,7 +88,7 @@ export class OpenAIProvider implements AIProvider {
       body.response_format = { type: 'json_object' };
     }
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -101,7 +99,7 @@ export class OpenAIProvider implements AIProvider {
 
     if (!response.ok) {
       const err = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${err}`);
+      throw new Error(`${this.name} API error: ${response.status} - ${err}`);
     }
 
     const data: any = await response.json();
@@ -117,19 +115,21 @@ export class OpenAIProvider implements AIProvider {
   }
 }
 
-// ============================================
-// Claude (Anthropic) Provider
-// ============================================
 export class ClaudeProvider implements AIProvider {
-  name = 'claude';
+  name: string;
   private apiKey: string;
+  private baseUrl: string;
+  private model: string;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, baseUrl: string, model: string, serviceName = 'claude') {
+    this.name = serviceName;
     this.apiKey = apiKey;
+    this.baseUrl = normalizeBaseUrl(baseUrl);
+    this.model = model;
   }
 
   async chat(messages: AIMessage[], options?: AIRequestOptions): Promise<AIResponse> {
-    const model = options?.model || 'claude-sonnet-4-20250514';
+    const model = options?.model || this.model;
 
     // Claude uses separate system message
     const systemMsg = messages.find(m => m.role === 'system');
@@ -148,7 +148,7 @@ export class ClaudeProvider implements AIProvider {
       body.system = systemMsg.content;
     }
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch(`${this.baseUrl}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -176,45 +176,70 @@ export class ClaudeProvider implements AIProvider {
   }
 }
 
-// ============================================
-// Factory: 根据配置创建Provider
-// ============================================
 export function createAIProvider(
   serviceName: string,
   env: { AI: any; DB: D1Database },
-  apiKey?: string
-): AIProvider {
-  switch (serviceName) {
-    case 'cloudflare-ai':
-      return new CloudflareAIProvider(env.AI);
-    case 'openai':
-      if (!apiKey) throw new Error('OpenAI需要配置API密钥');
-      return new OpenAIProvider(apiKey);
-    case 'claude':
-      if (!apiKey) throw new Error('Claude需要配置API密钥');
-      return new ClaudeProvider(apiKey);
-    default:
-      throw new Error(`不支持的AI服务: ${serviceName}`);
+  config?: {
+    apiKey?: string;
+    baseUrl?: string;
+    model?: string;
   }
+): AIProvider {
+  const definition = getAIServiceDefinition(serviceName);
+
+  if (!definition) {
+    throw new Error(`不支持的AI服务: ${serviceName}`);
+  }
+
+  if (definition.protocol === 'cloudflare') {
+    return new CloudflareAIProvider(env.AI, config?.model || definition.defaultModel);
+  }
+
+  if (!config?.apiKey) {
+    throw new Error(`${definition.name}需要配置API密钥`);
+  }
+
+  const resolvedBaseUrl = config.baseUrl || definition.defaultBaseUrl;
+  const resolvedModel = config.model || definition.defaultModel;
+
+  if (!resolvedBaseUrl) {
+    throw new Error(`${definition.name}需要配置Base URL`);
+  }
+
+  if (!resolvedModel) {
+    throw new Error(`${definition.name}需要配置模型名称`);
+  }
+
+  if (definition.protocol === 'anthropic') {
+    return new ClaudeProvider(config.apiKey, resolvedBaseUrl, resolvedModel, serviceName);
+  }
+
+  return new OpenAICompatibleProvider(serviceName, config.apiKey, resolvedBaseUrl, resolvedModel);
 }
 
-// 便捷函数: 从数据库获取用户的AI配置并创建Provider
 export async function getUserAIProvider(
   userId: number,
-  env: { AI: any; DB: D1Database }
+  env: { AI: any; DB: D1Database },
+  serviceName?: string,
 ): Promise<AIProvider> {
-  const config = await env.DB.prepare(
-    'SELECT service_name, api_key FROM ai_configs WHERE user_id = ? AND is_active = 1'
-  ).bind(userId).first();
+  const config = serviceName
+    ? await env.DB.prepare(
+      'SELECT service_name, api_key, base_url, model FROM ai_configs WHERE user_id = ? AND service_name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1'
+    ).bind(userId, serviceName).first()
+    : await env.DB.prepare(
+      'SELECT service_name, api_key, base_url, model FROM ai_configs WHERE user_id = ? AND is_active = 1'
+    ).bind(userId).first();
 
   if (!config) {
-    // 默认使用 Cloudflare AI
+    if (serviceName === 'cloudflare-ai') {
+      return new CloudflareAIProvider(env.AI);
+    }
+
     return new CloudflareAIProvider(env.AI);
   }
 
   let apiKey: string | undefined;
   if (config.api_key) {
-    // 解密API密钥 (Base64)
     try {
       apiKey = atob(config.api_key as string);
     } catch {
@@ -222,5 +247,9 @@ export async function getUserAIProvider(
     }
   }
 
-  return createAIProvider(config.service_name as string, env, apiKey);
+  return createAIProvider(config.service_name as string, env, {
+    apiKey,
+    baseUrl: config.base_url as string | undefined,
+    model: config.model as string | undefined,
+  });
 }

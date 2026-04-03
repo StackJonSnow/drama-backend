@@ -1,6 +1,9 @@
 import { Hono } from 'hono';
 import { verify } from 'hono/jwt';
 import type { Context, Next } from 'hono';
+import { AIServiceAccessError, ensureServiceReadyForGeneration } from '../services/ai-access';
+import type { AIProvider } from '../services/ai-provider';
+import { getUserAIProvider } from '../services/ai-provider';
 
 type Bindings = {
   DB: D1Database;
@@ -56,10 +59,6 @@ scriptRoutes.post('/generate', jwtAuth, async (c) => {
     }
     
     // 获取用户的AI配置
-    const aiConfig = await c.env.DB.prepare(
-      'SELECT * FROM ai_configs WHERE user_id = ? AND is_active = 1'
-    ).bind(payload.userId).first();
-    
     // 构建提示词
     const prompt = buildScriptPrompt({
       title,
@@ -74,19 +73,11 @@ scriptRoutes.post('/generate', jwtAuth, async (c) => {
     // 调用AI服务生成剧本
     let scriptContent;
     const usedAiService = ai_service || 'cloudflare-ai';
-    
-    if (usedAiService === 'cloudflare-ai') {
-      // 使用Cloudflare Workers AI
-      scriptContent = await generateWithCloudflareAI(c.env.AI, prompt);
-    } else if (usedAiService === 'openai' && aiConfig?.api_key) {
-      // 使用OpenAI API
-      scriptContent = await generateWithOpenAI(aiConfig.api_key as string, prompt);
-    } else if (usedAiService === 'claude' && aiConfig?.api_key) {
-      // 使用Claude API
-      scriptContent = await generateWithClaude(aiConfig.api_key as string, prompt);
-    } else {
-      return c.json({ success: false, error: '未配置AI服务或API密钥' }, 400);
-    }
+
+    await ensureServiceReadyForGeneration(c.env.DB, payload.userId, usedAiService);
+
+    const provider = await getUserAIProvider(payload.userId, c.env, usedAiService);
+    scriptContent = await generateWithProvider(provider, prompt);
     
     // 保存到数据库
     const result = await c.env.DB.prepare(`
@@ -129,6 +120,10 @@ scriptRoutes.post('/generate', jwtAuth, async (c) => {
     });
     
   } catch (error) {
+    if (error instanceof AIServiceAccessError) {
+      return c.json({ success: false, error: error.message }, 400);
+    }
+
     console.error('生成剧本错误:', error);
     return c.json({ success: false, error: '服务器内部错误' }, 500);
   }
@@ -278,75 +273,19 @@ function getLengthText(length: string): string {
   return lengths[length] || '短篇';
 }
 
-// 使用Cloudflare Workers AI生成
-async function generateWithCloudflareAI(ai: any, prompt: string): Promise<string> {
+async function generateWithProvider(provider: AIProvider, prompt: string): Promise<string> {
   try {
-    const response = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
-      messages: [
-        { role: 'system', content: '你是一个专业的剧本作家，擅长创作各种类型的剧本。请用中文回复。' },
-        { role: 'user', content: prompt }
-      ],
-      max_tokens: 2000
+    const response = await provider.chat([
+      { role: 'system', content: '你是一个专业的剧本作家，擅长创作各种类型的剧本。请用中文回复。' },
+      { role: 'user', content: prompt },
+    ], {
+      maxTokens: 2000,
+      temperature: 0.7,
     });
     
-    return response.response;
+    return response.content;
   } catch (error) {
-    console.error('Cloudflare AI error:', error);
+    console.error('AI generate error:', error);
     throw new Error('AI生成失败');
-  }
-}
-
-// 使用OpenAI生成
-async function generateWithOpenAI(apiKey: string, prompt: string): Promise<string> {
-  try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: '你是一个专业的剧本作家，擅长创作各种类型的剧本。请用中文回复。' },
-          { role: 'user', content: prompt }
-        ],
-        max_tokens: 2000,
-        temperature: 0.7
-      })
-    });
-    
-    const data = await response.json() as any;
-    return data.choices[0].message.content;
-  } catch (error) {
-    console.error('OpenAI error:', error);
-    throw new Error('OpenAI生成失败');
-  }
-}
-
-// 使用Claude生成
-async function generateWithClaude(apiKey: string, prompt: string): Promise<string> {
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-3-opus-20240229',
-        max_tokens: 2000,
-        messages: [
-          { role: 'user', content: `你是一个专业的剧本作家，擅长创作各种类型的剧本。请用中文回复。\n\n${prompt}` }
-        ]
-      })
-    });
-    
-    const data = await response.json() as any;
-    return data.content[0].text;
-  } catch (error) {
-    console.error('Claude error:', error);
-    throw new Error('Claude生成失败');
   }
 }

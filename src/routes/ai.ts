@@ -1,9 +1,12 @@
 import { Hono } from 'hono';
 import { verify } from 'hono/jwt';
 import type { Context, Next } from 'hono';
+import { getAIServiceCatalog, getAIServiceDefinition } from '../services/ai-catalog';
+import { validateAIConnection } from '../services/ai-validation';
 
 type Bindings = {
   DB: D1Database;
+  AI: any;
   JWT_SECRET: string;
 };
 
@@ -36,33 +39,9 @@ async function jwtAuth(c: Context<{ Bindings: Bindings; Variables: Variables }>,
 
 // 获取支持的AI服务列表
 aiRoutes.get('/services', async (c) => {
-  const services = [
-    {
-      id: 'cloudflare-ai',
-      name: 'Cloudflare Workers AI',
-      description: '使用Cloudflare内置的AI模型（Llama、Mistral等）',
-      requiresApiKey: false,
-      isDefault: true
-    },
-    {
-      id: 'openai',
-      name: 'OpenAI',
-      description: '使用OpenAI的GPT-4等模型',
-      requiresApiKey: true,
-      apiKeyFormat: 'sk-...'
-    },
-    {
-      id: 'claude',
-      name: 'Claude (Anthropic)',
-      description: '使用Anthropic的Claude模型',
-      requiresApiKey: true,
-      apiKeyFormat: 'sk-ant-...'
-    }
-  ];
-  
   return c.json({
     success: true,
-    data: { services }
+    data: { services: getAIServiceCatalog() }
   });
 });
 
@@ -72,7 +51,10 @@ aiRoutes.get('/config', jwtAuth, async (c) => {
     const payload = c.get('jwtPayload');
     
     const configs = await c.env.DB.prepare(
-      'SELECT id, service_name, is_active, created_at FROM ai_configs WHERE user_id = ?'
+      `SELECT id, service_name, base_url, model, is_active, validation_status, last_checked_at, last_check_message, created_at
+       FROM ai_configs
+       WHERE user_id = ?
+       ORDER BY is_active DESC, created_at DESC`
     ).bind(payload.userId).all();
     
     return c.json({
@@ -90,21 +72,39 @@ aiRoutes.get('/config', jwtAuth, async (c) => {
 aiRoutes.put('/config', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const { serviceName, apiKey } = await c.req.json();
+    const { serviceName, apiKey, baseUrl, model } = await c.req.json();
     
     if (!serviceName) {
       return c.json({ success: false, error: '服务名称是必填项' }, 400);
     }
+
+    const definition = getAIServiceDefinition(serviceName);
+
+    if (!definition) {
+      return c.json({ success: false, error: '不支持的 AI 渠道' }, 400);
+    }
+
+    if (definition.requiresApiKey && !apiKey) {
+      return c.json({ success: false, error: 'API Key 是必填项' }, 400);
+    }
+
+    if (definition.requiresBaseUrl && !baseUrl) {
+      return c.json({ success: false, error: 'Base URL 是必填项' }, 400);
+    }
+
+    if (definition.requiresModel && !model) {
+      return c.json({ success: false, error: '模型名称是必填项' }, 400);
+    }
+
+    const checkedAt = new Date().toISOString();
     
-    // 检查是否已存在该服务的配置
     const existingConfig = await c.env.DB.prepare(
       'SELECT id FROM ai_configs WHERE user_id = ? AND service_name = ?'
     ).bind(payload.userId, serviceName).first();
     
     if (existingConfig) {
-      // 更新现有配置
-      let updateQuery = 'UPDATE ai_configs SET is_active = 1, updated_at = ?';
-      const updateValues: any[] = [new Date().toISOString()];
+      let updateQuery = 'UPDATE ai_configs SET is_active = 1, updated_at = ?, base_url = ?, model = ?, validation_status = ?, last_checked_at = ?, last_check_message = ?';
+      const updateValues: any[] = [checkedAt, baseUrl || null, model || null, 'pending', checkedAt, '配置已保存，建议重新检测'];
       
       if (apiKey) {
         updateQuery += ', api_key = ?';
@@ -116,24 +116,29 @@ aiRoutes.put('/config', jwtAuth, async (c) => {
       
       await c.env.DB.prepare(updateQuery).bind(...updateValues).run();
       
-      // 将其他配置设为非活跃
       await c.env.DB.prepare(
         'UPDATE ai_configs SET is_active = 0 WHERE user_id = ? AND id != ?'
       ).bind(payload.userId, existingConfig.id).run();
       
     } else {
-      // 创建新配置
       await c.env.DB.prepare(`
-        INSERT INTO ai_configs (user_id, service_name, api_key, is_active, created_at)
-        VALUES (?, ?, ?, 1, ?)
+        INSERT INTO ai_configs (
+          user_id, service_name, api_key, base_url, model, is_active,
+          validation_status, last_checked_at, last_check_message, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
       `).bind(
         payload.userId,
         serviceName,
         apiKey ? encryptApiKey(apiKey) : null,
-        new Date().toISOString()
+        baseUrl || null,
+        model || null,
+        'pending',
+        checkedAt,
+        '配置已保存，建议重新检测',
+        checkedAt
       ).run();
       
-      // 将其他配置设为非活跃
       await c.env.DB.prepare(
         'UPDATE ai_configs SET is_active = 0 WHERE user_id = ? AND service_name != ?'
       ).bind(payload.userId, serviceName).run();
@@ -178,47 +183,39 @@ aiRoutes.delete('/config/:id', jwtAuth, async (c) => {
 // 测试AI服务连接
 aiRoutes.post('/test', jwtAuth, async (c) => {
   try {
-    const { serviceName, apiKey } = await c.req.json();
-    
-    let testResult = false;
-    let errorMessage = '';
-    
-    if (serviceName === 'cloudflare-ai') {
-      testResult = true; // Cloudflare AI总是可用
-    } else if (serviceName === 'openai' && apiKey) {
-      try {
-        const response = await fetch('https://api.openai.com/v1/models', {
-          headers: { 'Authorization': `Bearer ${apiKey}` }
-        });
-        testResult = response.ok;
-        if (!testResult) {
-          errorMessage = 'OpenAI API密钥无效';
-        }
-      } catch {
-        errorMessage = '无法连接到OpenAI API';
-      }
-    } else if (serviceName === 'claude' && apiKey) {
-      try {
-        const response = await fetch('https://api.anthropic.com/v1/models', {
-          headers: { 
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01'
-          }
-        });
-        testResult = response.ok;
-        if (!testResult) {
-          errorMessage = 'Claude API密钥无效';
-        }
-      } catch {
-        errorMessage = '无法连接到Claude API';
-      }
-    } else {
-      errorMessage = '请提供API密钥';
+    const payload = c.get('jwtPayload');
+    const { serviceName, apiKey, baseUrl, model } = await c.req.json();
+    const validation = await validateAIConnection(c.env, { serviceName, apiKey, baseUrl, model });
+
+    const checkedAt = new Date().toISOString();
+    const existingConfig = await c.env.DB.prepare(
+      'SELECT id FROM ai_configs WHERE user_id = ? AND service_name = ?'
+    ).bind(payload.userId, serviceName).first();
+
+    if (existingConfig) {
+      await c.env.DB.prepare(
+        `UPDATE ai_configs
+         SET validation_status = ?, last_checked_at = ?, last_check_message = ?, updated_at = ?, base_url = COALESCE(?, base_url), model = COALESCE(?, model)
+         WHERE user_id = ? AND service_name = ?`
+      ).bind(
+        validation.success ? 'passed' : 'failed',
+        checkedAt,
+        validation.message,
+        checkedAt,
+        validation.resolvedBaseUrl || null,
+        validation.resolvedModel || null,
+        payload.userId,
+        serviceName,
+      ).run();
     }
     
     return c.json({
-      success: testResult,
-      message: testResult ? '连接成功' : errorMessage
+      success: validation.success,
+      message: validation.message,
+      data: {
+        resolvedBaseUrl: validation.resolvedBaseUrl,
+        resolvedModel: validation.resolvedModel,
+      }
     });
     
   } catch (error) {

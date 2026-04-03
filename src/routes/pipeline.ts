@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { sign, verify } from 'hono/jwt';
 import type { Context, Next } from 'hono';
+import { AIServiceAccessError, ensureServiceReadyForGeneration } from '../services/ai-access';
 import { getUserAIProvider } from '../services/ai-provider';
 import {
   executePipelinePhase1,
@@ -110,6 +111,8 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       return c.json({ success: false, error: '标题、题材和剧本类型是必填项' }, 400);
     }
 
+    await ensureServiceReadyForGeneration(c.env.DB, payload.userId, ai_service || 'cloudflare-ai');
+
     const taskId = generateTaskId();
     const now = new Date().toISOString();
 
@@ -157,6 +160,10 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
     });
 
   } catch (error) {
+    if (error instanceof AIServiceAccessError) {
+      return c.json({ success: false, error: error.message }, 400);
+    }
+
     console.error('创建流水线任务错误:', error);
     return c.json({ success: false, error: '创建任务失败' }, 500);
   }
@@ -169,7 +176,7 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
 pipelineRoutes.get('/:id/status', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
 
     const task = await c.env.DB.prepare(
       'SELECT * FROM generation_tasks WHERE id = ? AND user_id = ?'
@@ -294,7 +301,7 @@ pipelineRoutes.post('/:id/resume', jwtAuth, async (c) => {
 pipelineRoutes.post('/:id/cancel', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
 
     const result = await c.env.DB.prepare(
       'UPDATE generation_tasks SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?'
@@ -320,7 +327,7 @@ pipelineRoutes.post('/:id/cancel', jwtAuth, async (c) => {
  * SSE 流式获取生成进度
  */
 pipelineRoutes.get('/:id/stream', async (c) => {
-  const taskId = c.req.param('id');
+  const taskId = c.req.param('id') || '';
   const token = c.req.query('token');
 
   // SSE需要通过query参数传递token（EventSource不支持自定义header）
@@ -360,7 +367,7 @@ pipelineRoutes.get('/:id/stream', async (c) => {
 pipelineRoutes.get('/:id/episodes', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
 
     // 验证任务归属
     const task = await c.env.DB.prepare(
@@ -409,7 +416,7 @@ pipelineRoutes.get('/:id/episodes', jwtAuth, async (c) => {
 pipelineRoutes.get('/:id/episodes/:ep', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
     const episodeNumber = parseInt(c.req.param('ep') || '0');
 
     const task = await c.env.DB.prepare(
@@ -446,7 +453,7 @@ pipelineRoutes.get('/:id/episodes/:ep', jwtAuth, async (c) => {
 pipelineRoutes.get('/:id/export', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
     const format = c.req.query('format') || 'markdown';
 
     const task = await c.env.DB.prepare(
@@ -486,7 +493,7 @@ pipelineRoutes.get('/:id/export', jwtAuth, async (c) => {
 pipelineRoutes.get('/:id/versions', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
 
     const task = await c.env.DB.prepare(
       'SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?'
@@ -520,7 +527,7 @@ pipelineRoutes.get('/:id/versions', jwtAuth, async (c) => {
 pipelineRoutes.get('/:id/versions/:versionId', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
     const versionId = c.req.param('versionId');
 
     const task = await c.env.DB.prepare(
@@ -558,7 +565,7 @@ pipelineRoutes.get('/:id/versions/:versionId', jwtAuth, async (c) => {
 pipelineRoutes.post('/:id/versions', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
-    const taskId = c.req.param('id');
+    const taskId = c.req.param('id') || '';
     const body = await c.req.json().catch(() => ({}));
     const label = typeof body.label === 'string' ? body.label.trim() : '';
     const changeNotes = typeof body.changeNotes === 'string' ? body.changeNotes.trim() : '';
@@ -606,6 +613,77 @@ pipelineRoutes.post('/:id/versions', jwtAuth, async (c) => {
   } catch (error) {
     console.error('创建版本快照错误:', error);
     return c.json({ success: false, error: error instanceof Error ? error.message : '创建版本失败' }, 500);
+  }
+});
+
+/**
+ * POST /api/pipeline/:id/versions/:versionId/branch
+ * 从历史版本派生新版本
+ */
+pipelineRoutes.post('/:id/versions/:versionId/branch', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id');
+    const versionId = c.req.param('versionId');
+    const body = await c.req.json().catch(() => ({}));
+    const label = typeof body.label === 'string' ? body.label.trim() : '';
+    const changeNotes = typeof body.changeNotes === 'string' ? body.changeNotes.trim() : '';
+
+    const task = await c.env.DB.prepare(
+      'SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?'
+    ).bind(taskId, payload.userId).first();
+
+    if (!task) {
+      return c.json({ success: false, error: '任务不存在' }, 404);
+    }
+
+    const sourceVersion = await c.env.DB.prepare(`
+      SELECT id, version, label, content, change_notes
+      FROM script_versions
+      WHERE id = ? AND task_id = ?
+    `).bind(versionId, taskId).first();
+
+    if (!sourceVersion) {
+      return c.json({ success: false, error: '源版本不存在' }, 404);
+    }
+
+    const latestVersion = await c.env.DB.prepare(
+      'SELECT version FROM script_versions WHERE task_id = ? ORDER BY version DESC LIMIT 1'
+    ).bind(taskId).first();
+
+    const nextVersion = Number(latestVersion?.version || 0) + 1;
+    const finalLabel = label || `${sourceVersion.label || `版本 ${sourceVersion.version}`} · 派生版`;
+    const finalNotes = [
+      `派生自 v${sourceVersion.version}${sourceVersion.label ? `（${sourceVersion.label}）` : ''}`,
+      changeNotes,
+    ].filter(Boolean).join('\n');
+
+    const result = await c.env.DB.prepare(`
+      INSERT INTO script_versions (task_id, version, label, content, change_notes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      taskId,
+      nextVersion,
+      finalLabel,
+      sourceVersion.content,
+      finalNotes || null,
+      new Date().toISOString()
+    ).run();
+
+    const version = await c.env.DB.prepare(`
+      SELECT id, task_id, version, label, content, change_notes, created_at
+      FROM script_versions
+      WHERE id = ?
+    `).bind(result.meta.last_row_id).first();
+
+    return c.json({
+      success: true,
+      message: '已从历史版本创建派生版本',
+      data: { version },
+    });
+  } catch (error) {
+    console.error('派生版本错误:', error);
+    return c.json({ success: false, error: error instanceof Error ? error.message : '派生版本失败' }, 500);
   }
 });
 
@@ -749,7 +827,9 @@ async function runPipeline(
     if (!task) return;
 
     // 获取AI Provider
-    const provider = await getUserAIProvider(userId, c.env);
+    await ensureServiceReadyForGeneration(c.env.DB, userId, task.ai_service as string);
+
+    const provider = await getUserAIProvider(userId, c.env, task.ai_service as string);
 
     const input: TaskInput = {
       title: task.title as string,
