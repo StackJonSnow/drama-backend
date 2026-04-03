@@ -21,6 +21,16 @@ type Variables = {
 
 export const aiRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
+type AIConfigRecord = {
+  id: number;
+  api_key?: string | null;
+  base_url?: string | null;
+  model?: string | null;
+  validation_status?: 'pending' | 'passed' | 'failed' | null;
+  last_checked_at?: string | null;
+  last_check_message?: string | null;
+};
+
 // 动态JWT认证中间件
 async function jwtAuth(c: Context<{ Bindings: Bindings; Variables: Variables }>, next: Next) {
   const authHeader = c.req.header('Authorization');
@@ -84,38 +94,78 @@ aiRoutes.put('/config', jwtAuth, async (c) => {
       return c.json({ success: false, error: '不支持的 AI 渠道' }, 400);
     }
 
-    if (definition.requiresApiKey && !apiKey) {
+    const now = new Date().toISOString();
+    
+    const existingConfig = await c.env.DB.prepare(
+      `SELECT id, api_key, base_url, model, validation_status, last_checked_at, last_check_message
+       FROM ai_configs
+       WHERE user_id = ? AND service_name = ?`
+    ).bind(payload.userId, serviceName).first<AIConfigRecord>();
+
+    const existingApiKey = decryptApiKey(existingConfig?.api_key);
+    const submittedApiKey = typeof apiKey === 'string' ? apiKey.trim() : '';
+    const resolvedApiKey = submittedApiKey || existingApiKey;
+    const resolvedBaseUrl = typeof baseUrl === 'string'
+      ? baseUrl.trim() || null
+      : (existingConfig?.base_url ?? null);
+    const resolvedModel = typeof model === 'string'
+      ? model.trim() || null
+      : (existingConfig?.model ?? null);
+
+    if (definition.requiresApiKey && !resolvedApiKey) {
       return c.json({ success: false, error: 'API Key 是必填项' }, 400);
     }
 
-    if (definition.requiresBaseUrl && !baseUrl) {
+    if (definition.requiresBaseUrl && !resolvedBaseUrl) {
       return c.json({ success: false, error: 'Base URL 是必填项' }, 400);
     }
 
-    if (definition.requiresModel && !model) {
+    if (definition.requiresModel && !resolvedModel) {
       return c.json({ success: false, error: '模型名称是必填项' }, 400);
     }
 
-    const checkedAt = new Date().toISOString();
-    
-    const existingConfig = await c.env.DB.prepare(
-      'SELECT id FROM ai_configs WHERE user_id = ? AND service_name = ?'
-    ).bind(payload.userId, serviceName).first();
+    const hasNewApiKey = submittedApiKey.length > 0;
+    const configChanged = existingConfig
+      ? (
+        (hasNewApiKey && submittedApiKey !== existingApiKey)
+        || resolvedBaseUrl !== (existingConfig.base_url ?? null)
+        || resolvedModel !== (existingConfig.model ?? null)
+      )
+      : true;
+
+    const nextValidationStatus = existingConfig && !configChanged
+      ? (existingConfig.validation_status ?? 'pending')
+      : 'pending';
+    const nextCheckedAt = existingConfig && !configChanged
+      ? (existingConfig.last_checked_at ?? null)
+      : now;
+    const nextCheckMessage = existingConfig && !configChanged
+      ? (existingConfig.last_check_message || (nextValidationStatus === 'passed' ? '渠道检测通过' : '配置已保存'))
+      : '配置已保存，建议重新检测';
     
     if (existingConfig) {
-      let updateQuery = 'UPDATE ai_configs SET is_active = 1, updated_at = ?, base_url = ?, model = ?, validation_status = ?, last_checked_at = ?, last_check_message = ?';
-      const updateValues: any[] = [checkedAt, baseUrl || null, model || null, 'pending', checkedAt, '配置已保存，建议重新检测'];
-      
-      if (apiKey) {
-        updateQuery += ', api_key = ?';
-        updateValues.push(encryptApiKey(apiKey));
-      }
-      
-      updateQuery += ' WHERE id = ?';
-      updateValues.push(existingConfig.id);
-      
-      await c.env.DB.prepare(updateQuery).bind(...updateValues).run();
-      
+      await c.env.DB.prepare(
+        `UPDATE ai_configs
+         SET is_active = 1,
+             updated_at = ?,
+             api_key = ?,
+             base_url = ?,
+             model = ?,
+             validation_status = ?,
+             last_checked_at = ?,
+             last_check_message = ?
+         WHERE id = ?`
+      ).bind(
+        now,
+        resolvedApiKey ? encryptApiKey(resolvedApiKey) : null,
+        resolvedBaseUrl,
+        resolvedModel,
+        nextValidationStatus,
+        nextCheckedAt,
+        nextCheckMessage,
+        existingConfig.id,
+      ).run();
+       
       await c.env.DB.prepare(
         'UPDATE ai_configs SET is_active = 0 WHERE user_id = ? AND id != ?'
       ).bind(payload.userId, existingConfig.id).run();
@@ -124,19 +174,20 @@ aiRoutes.put('/config', jwtAuth, async (c) => {
       await c.env.DB.prepare(`
         INSERT INTO ai_configs (
           user_id, service_name, api_key, base_url, model, is_active,
-          validation_status, last_checked_at, last_check_message, created_at
+          validation_status, last_checked_at, last_check_message, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
       `).bind(
         payload.userId,
         serviceName,
-        apiKey ? encryptApiKey(apiKey) : null,
-        baseUrl || null,
-        model || null,
-        'pending',
-        checkedAt,
-        '配置已保存，建议重新检测',
-        checkedAt
+        resolvedApiKey ? encryptApiKey(resolvedApiKey) : null,
+        resolvedBaseUrl,
+        resolvedModel,
+        nextValidationStatus,
+        nextCheckedAt,
+        nextCheckMessage,
+        now,
+        now,
       ).run();
       
       await c.env.DB.prepare(
@@ -185,19 +236,36 @@ aiRoutes.post('/test', jwtAuth, async (c) => {
   try {
     const payload = c.get('jwtPayload');
     const { serviceName, apiKey, baseUrl, model } = await c.req.json();
-    const validation = await validateAIConnection(c.env, { serviceName, apiKey, baseUrl, model });
+
+    const existingConfig = await c.env.DB.prepare(
+      'SELECT id, api_key, is_active FROM ai_configs WHERE user_id = ? AND service_name = ?'
+    ).bind(payload.userId, serviceName).first<{ id: number; api_key?: string | null; is_active?: number }>();
+
+    const submittedApiKey = typeof apiKey === 'string' ? apiKey.trim() : '';
+    const resolvedApiKey = submittedApiKey || decryptApiKey(existingConfig?.api_key);
+    const validation = await validateAIConnection(c.env, {
+      serviceName,
+      apiKey: resolvedApiKey,
+      baseUrl,
+      model,
+    });
 
     const checkedAt = new Date().toISOString();
-    const existingConfig = await c.env.DB.prepare(
-      'SELECT id FROM ai_configs WHERE user_id = ? AND service_name = ?'
-    ).bind(payload.userId, serviceName).first();
+    const encryptedApiKey = resolvedApiKey ? encryptApiKey(resolvedApiKey) : null;
 
     if (existingConfig) {
       await c.env.DB.prepare(
         `UPDATE ai_configs
-         SET validation_status = ?, last_checked_at = ?, last_check_message = ?, updated_at = ?, base_url = COALESCE(?, base_url), model = COALESCE(?, model)
+         SET api_key = COALESCE(?, api_key),
+             validation_status = ?,
+             last_checked_at = ?,
+             last_check_message = ?,
+             updated_at = ?,
+             base_url = COALESCE(?, base_url),
+             model = COALESCE(?, model)
          WHERE user_id = ? AND service_name = ?`
       ).bind(
+        encryptedApiKey,
         validation.success ? 'passed' : 'failed',
         checkedAt,
         validation.message,
@@ -206,6 +274,25 @@ aiRoutes.post('/test', jwtAuth, async (c) => {
         validation.resolvedModel || null,
         payload.userId,
         serviceName,
+      ).run();
+    } else {
+      await c.env.DB.prepare(
+        `INSERT INTO ai_configs (
+           user_id, service_name, api_key, base_url, model, is_active,
+           validation_status, last_checked_at, last_check_message, created_at, updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+      ).bind(
+        payload.userId,
+        serviceName,
+        encryptedApiKey,
+        validation.resolvedBaseUrl || null,
+        validation.resolvedModel || null,
+        validation.success ? 'passed' : 'failed',
+        checkedAt,
+        validation.message,
+        checkedAt,
+        checkedAt,
       ).run();
     }
     
@@ -228,4 +315,16 @@ aiRoutes.post('/test', jwtAuth, async (c) => {
 function encryptApiKey(apiKey: string): string {
   // 这里使用简单的Base64编码，实际应用应使用AES加密
   return btoa(apiKey);
+}
+
+function decryptApiKey(apiKey?: string | null): string | undefined {
+  if (!apiKey) {
+    return undefined;
+  }
+
+  try {
+    return atob(apiKey);
+  } catch {
+    return apiKey;
+  }
 }
