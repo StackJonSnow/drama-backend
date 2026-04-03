@@ -13,6 +13,7 @@ import {
   dialogueGenerationPrompt,
   scriptCompositionPrompt,
   evaluationPrompt,
+  type PromptPackage,
   type TaskInput,
 } from './prompts';
 
@@ -111,6 +112,33 @@ async function callAI(
   const jsonMode = options.jsonMode ?? true;
   const timeoutMs = options.timeoutMs ?? 120000;
 
+  const resolveMaxTokens = (stepNumber: number, compressed: boolean, plainText: boolean): number => {
+    if (compressed) {
+      return plainText ? 4500 : 2400;
+    }
+
+    switch (stepNumber) {
+      case 1:
+        return 2200;
+      case 2:
+        return 3200;
+      case 3:
+        return 2600;
+      case 4:
+        return 3400;
+      case 5:
+        return 2600;
+      case 6:
+        return 2600;
+      case 7:
+        return 5200;
+      case 8:
+        return 1600;
+      default:
+        return plainText ? 4500 : 2600;
+    }
+  };
+
   const runAttempt = async (attempt: number, compressed: boolean, currentSystem: string, currentUser: string): Promise<any> => {
     const messages = [
       { role: 'system' as const, content: currentSystem },
@@ -119,6 +147,37 @@ async function callAI(
 
     const startedAt = Date.now();
     const activeModel = provider.model || 'default';
+    const maxTokens = resolveMaxTokens(options.stepNumber, compressed, !jsonMode);
+    const abortController = new AbortController();
+
+    const onAbort = () => {
+      abortController.abort(new Error('PIPELINE_ABORTED'));
+    };
+
+    context.abortSignal?.addEventListener('abort', onAbort, { once: true });
+
+    let streamedOutput = '';
+    let streamedSinceLastEmit = '';
+    let lastStreamEmitAt = Date.now();
+
+    const emitStreamChunk = async (force = false) => {
+      if (!streamedSinceLastEmit) return;
+      const now = Date.now();
+      if (!force && streamedSinceLastEmit.length < 160 && now - lastStreamEmitAt < 1200) {
+        return;
+      }
+
+      await context.onLiveLog?.({
+        level: 'info',
+        stepNumber: options.stepNumber,
+        stepName: options.stepName,
+        episodeNumber: options.episodeNumber,
+        message: `[AI Output Stream] ${provider.name}/${activeModel}`,
+        detail: streamedSinceLastEmit,
+      });
+      streamedSinceLastEmit = '';
+      lastStreamEmitAt = now;
+    };
 
     await context.onLog?.({
       level: 'info',
@@ -126,7 +185,7 @@ async function callAI(
       stepName: options.stepName,
       episodeNumber: options.episodeNumber,
       message: `[AI] 请求 ${provider.name}/${activeModel} · 尝试 ${attempt}${compressed ? '（压缩上下文）' : ''}`,
-      detail: `model=${activeModel}, system=${currentSystem.length} chars, user=${currentUser.length} chars, jsonMode=${jsonMode}`,
+      detail: `model=${activeModel}, system=${currentSystem.length} chars, user=${currentUser.length} chars, jsonMode=${jsonMode}, maxTokens=${maxTokens}`,
     });
 
     await context.onLiveLog?.({
@@ -153,34 +212,44 @@ async function callAI(
       }, 15000);
 
       const aiPromise = provider.chat(messages, {
-        maxTokens: compressed ? 4096 : 8192,
+        maxTokens,
         temperature: 0.7,
         jsonMode,
+        signal: abortController.signal,
+        onChunk: async (chunk) => {
+          streamedOutput += chunk;
+          streamedSinceLastEmit += chunk;
+          await emitStreamChunk();
+        },
       });
 
       const timeoutPromise = new Promise<never>((_, reject) => {
         const timer = setTimeout(() => {
+          abortController.abort(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
           reject(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
         }, timeoutMs);
         context.abortSignal?.addEventListener('abort', () => {
           clearTimeout(timer);
+          abortController.abort(new Error('PIPELINE_ABORTED'));
           reject(new Error('PIPELINE_ABORTED'));
         }, { once: true });
       });
 
       const response = await Promise.race([aiPromise, timeoutPromise]);
+      await emitStreamChunk(true);
       const elapsedMs = Date.now() - startedAt;
       const usage = response.usage
         ? `tokens=${response.usage.totalTokens} (prompt=${response.usage.promptTokens}, completion=${response.usage.completionTokens})`
         : 'tokens=unknown';
-      const preview = response.content.substring(0, 280).replace(/\n/g, ' ');
+      const finalContent = response.content || streamedOutput;
+      const preview = finalContent.substring(0, 280).replace(/\n/g, ' ');
 
       await context.onLog?.({
         level: 'success',
         stepNumber: options.stepNumber,
         stepName: options.stepName,
         episodeNumber: options.episodeNumber,
-        message: `[AI] 响应成功 · ${response.content.length} chars · ${usage} · 耗时${elapsedMs}ms`,
+        message: `[AI] 响应成功 · ${finalContent.length} chars · ${usage} · 耗时${elapsedMs}ms`,
         detail: preview,
       });
 
@@ -190,12 +259,12 @@ async function callAI(
         stepName: options.stepName,
         episodeNumber: options.episodeNumber,
         message: `[AI Output] ${provider.name}/${activeModel}`,
-        detail: `[Meta]\n耗时: ${elapsedMs}ms\n${usage}\n\n[Content]\n${response.content}`,
+        detail: `[Meta]\n耗时: ${elapsedMs}ms\n${usage}\n\n[Content]\n${finalContent}`,
       });
 
       if (jsonMode) {
         try {
-          return parseJsonResponse(response.content);
+          return parseJsonResponse(finalContent);
         } catch (parseErr) {
           await context.onLog?.({
             level: 'warning',
@@ -205,13 +274,13 @@ async function callAI(
             message: '[AI] JSON解析失败，尝试提取可恢复片段',
             detail: parseErr instanceof Error ? parseErr.message : String(parseErr),
           });
-          const extracted = extractJson(response.content);
+          const extracted = extractJson(finalContent);
           if (extracted) return extracted;
           throw parseErr;
         }
       }
 
-      return response.content;
+      return finalContent;
     } catch (error) {
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
@@ -265,6 +334,7 @@ async function callAI(
 
       return runAttempt(attempt + 1, true, compressedSystem, compressedUser);
     } finally {
+      context.abortSignal?.removeEventListener('abort', onAbort);
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
       }
@@ -331,6 +401,27 @@ async function recordStepError(
   await context.onError?.(stepNumber, stepName, errorMessage);
 }
 
+async function persistCurrentTaskSummary(
+  context: PipelineContext,
+  prompt: PromptPackage,
+  stepNumber: number,
+  stepName: string,
+  episodeNumber?: number,
+): Promise<void> {
+  await context.db.prepare(
+    'UPDATE pipeline_steps SET current_task_summary = ? WHERE task_id = ? AND step_number = ?'
+  ).bind(prompt.currentTaskSummary, context.taskId, stepNumber).run();
+
+  await context.onLog?.({
+    level: 'info',
+    stepNumber,
+    stepName,
+    episodeNumber,
+    message: '[Current Task Summary]',
+    detail: prompt.currentTaskSummary,
+  });
+}
+
 /**
  * 检查是否被中断
  */
@@ -350,6 +441,7 @@ function checkAbort(context: PipelineContext): void {
 export async function executeStep1(context: PipelineContext): Promise<any> {
   await context.onLog?.({ level: 'info', stepNumber: 1, stepName: 'story_outline', message: '[Step 1] 生成故事大纲' });
   const prompt = storyOutlinePrompt(context.input);
+  await persistCurrentTaskSummary(context, prompt, 1, 'story_outline');
   const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 1, stepName: 'story_outline' });
   await context.onStepComplete?.(1, 'story_outline', result);
   return result;
@@ -362,6 +454,7 @@ export async function executeStep2(context: PipelineContext, storyOutline: any):
   checkAbort(context);
   await context.onLog?.({ level: 'info', stepNumber: 2, stepName: 'characters', message: '[Step 2] 生成角色设定' });
   const prompt = characterGenerationPrompt(context.input, storyOutline);
+  await persistCurrentTaskSummary(context, prompt, 2, 'characters');
   const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 2, stepName: 'characters' });
   await context.onStepComplete?.(2, 'characters', result);
   return result;
@@ -374,6 +467,7 @@ export async function executeStep3(context: PipelineContext, storyOutline: any, 
   checkAbort(context);
   await context.onLog?.({ level: 'info', stepNumber: 3, stepName: 'plot_structure', message: '[Step 3] 生成剧情结构' });
   const prompt = plotStructurePrompt(context.input, storyOutline, characters);
+  await persistCurrentTaskSummary(context, prompt, 3, 'plot_structure');
   const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 3, stepName: 'plot_structure' });
   await context.onStepComplete?.(3, 'plot_structure', result);
   return result;
@@ -390,6 +484,7 @@ export async function executeStep4(
   checkAbort(context);
   await context.onLog?.({ level: 'info', stepNumber: 4, stepName: 'episode_plan', message: '[Step 4] 生成集数拆分计划' });
   const prompt = episodePlanningPrompt(context.input, storyOutline, plotStructure, context.totalEpisodes);
+  await persistCurrentTaskSummary(context, prompt, 4, 'episode_plan');
   const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 4, stepName: 'episode_plan' });
   await context.onStepComplete?.(4, 'episode_plan', result);
   return result;
@@ -460,6 +555,7 @@ export async function executeStep5To7(
       context.input, storyOutline, characters, episode,
       completedEpisodes.slice(-3)
     );
+    await persistCurrentTaskSummary(context, scenePrompt, 5, 'scenes', episode.episodeNumber);
     const scenes = await callAI(context.provider, scenePrompt.system, scenePrompt.user, context, {
       stepNumber: 5,
       stepName: 'scenes',
@@ -482,6 +578,7 @@ export async function executeStep5To7(
     const dialoguePrompt = dialogueGenerationPrompt(
       context.input, characters, episode, scenes.scenes || []
     );
+    await persistCurrentTaskSummary(context, dialoguePrompt, 6, 'dialogue', episode.episodeNumber);
     const dialogues = await callAI(context.provider, dialoguePrompt.system, dialoguePrompt.user, context, {
       stepNumber: 6,
       stepName: 'dialogue',
@@ -504,6 +601,7 @@ export async function executeStep5To7(
     const composePrompt = scriptCompositionPrompt(
       episode, scenes.scenes || [], dialogues.dialogues || []
     );
+    await persistCurrentTaskSummary(context, composePrompt, 7, 'compose', episode.episodeNumber);
     const content = await callAI(
       context.provider,
       composePrompt.system,
@@ -580,6 +678,7 @@ export async function executeStep8(context: PipelineContext, storyOutline: any):
   }
 
   const prompt = evaluationPrompt(context.input, storyOutline, sampleEpisode.content as string);
+  await persistCurrentTaskSummary(context, prompt, 8, 'evaluate');
   const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 8, stepName: 'evaluate' });
   await context.onStepComplete?.(8, 'evaluate', result);
   return result;

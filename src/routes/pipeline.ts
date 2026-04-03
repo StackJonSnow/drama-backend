@@ -994,7 +994,7 @@ pipelineRoutes.get('/:id/steps', jwtAuth, async (c) => {
     }
 
     const steps = await c.env.DB.prepare(
-      'SELECT step_number, step_name, status, error_message, started_at, completed_at FROM pipeline_steps WHERE task_id = ? ORDER BY step_number'
+      'SELECT step_number, step_name, status, error_message, current_task_summary, started_at, completed_at FROM pipeline_steps WHERE task_id = ? ORDER BY step_number'
     ).bind(taskId).all();
 
     return c.json({
@@ -1069,6 +1069,7 @@ pipelineRoutes.get('/:id/steps/:step/content', jwtAuth, async (c) => {
         status: step.status,
         content: step.content ? JSON.parse(step.content as string) : null,
         error_message: step.error_message,
+        current_task_summary: step.current_task_summary,
         started_at: step.started_at,
         completed_at: step.completed_at,
       },
