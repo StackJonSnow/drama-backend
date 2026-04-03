@@ -23,13 +23,28 @@ export interface AIResponse {
 
 export interface AIProvider {
   name: string;
+  model?: string;
   chat(messages: AIMessage[], options?: AIRequestOptions): Promise<AIResponse>;
 }
 
+export interface UserAIConfigSnapshot {
+  serviceName: string;
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+}
+
+type DBUserAIConfigRecord = {
+  service_name: string;
+  api_key?: string | null;
+  base_url?: string | null;
+  model?: string | null;
+};
+
 export class CloudflareAIProvider implements AIProvider {
   name = 'cloudflare-ai';
+  model: string;
   private ai: any;
-  private model: string;
 
   constructor(ai: any, model = '@cf/meta/llama-3.1-8b-instruct') {
     this.ai = ai;
@@ -63,9 +78,9 @@ export class CloudflareAIProvider implements AIProvider {
 
 export class OpenAICompatibleProvider implements AIProvider {
   name: string;
+  model: string;
   private apiKey: string;
   private baseUrl: string;
-  private model: string;
 
   constructor(serviceName: string, apiKey: string, baseUrl: string, model: string) {
     this.name = serviceName;
@@ -117,9 +132,9 @@ export class OpenAICompatibleProvider implements AIProvider {
 
 export class ClaudeProvider implements AIProvider {
   name: string;
+  model: string;
   private apiKey: string;
   private baseUrl: string;
-  private model: string;
 
   constructor(apiKey: string, baseUrl: string, model: string, serviceName = 'claude') {
     this.name = serviceName;
@@ -217,29 +232,19 @@ export function createAIProvider(
   return new OpenAICompatibleProvider(serviceName, config.apiKey, resolvedBaseUrl, resolvedModel);
 }
 
-export async function getUserAIProvider(
+export async function getUserAIConfigSnapshot(
   userId: number,
   env: { AI: any; DB: D1Database },
-  serviceName?: string,
-): Promise<AIProvider> {
-  const config = serviceName
-    ? await env.DB.prepare(
-      'SELECT service_name, api_key, base_url, model FROM ai_configs WHERE user_id = ? AND service_name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1'
-    ).bind(userId, serviceName).first()
-    : await env.DB.prepare(
-      'SELECT service_name, api_key, base_url, model FROM ai_configs WHERE user_id = ? AND is_active = 1'
-    ).bind(userId).first();
+  serviceName = 'cloudflare-ai',
+): Promise<UserAIConfigSnapshot> {
+  const config = await env.DB.prepare(
+    'SELECT service_name, api_key, base_url, model FROM ai_configs WHERE user_id = ? AND service_name = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1'
+  ).bind(userId, serviceName).first() as DBUserAIConfigRecord | null;
 
-  if (!config) {
-    if (serviceName === 'cloudflare-ai') {
-      return new CloudflareAIProvider(env.AI);
-    }
-
-    return new CloudflareAIProvider(env.AI);
-  }
+  const definition = getAIServiceDefinition(serviceName);
 
   let apiKey: string | undefined;
-  if (config.api_key) {
+  if (config?.api_key) {
     try {
       apiKey = atob(config.api_key as string);
     } catch {
@@ -247,9 +252,60 @@ export async function getUserAIProvider(
     }
   }
 
-  return createAIProvider(config.service_name as string, env, {
+  return {
+    serviceName,
     apiKey,
-    baseUrl: config.base_url as string | undefined,
-    model: config.model as string | undefined,
+    baseUrl: (config?.base_url as string | undefined) || definition?.defaultBaseUrl,
+    model: (config?.model as string | undefined) || definition?.defaultModel,
+  };
+}
+
+export async function getUserAIProvider(
+  userId: number,
+  env: { AI: any; DB: D1Database },
+  serviceName?: string,
+  overrides?: {
+    model?: string;
+  },
+): Promise<AIProvider> {
+  const config = (serviceName
+    ? await getUserAIConfigSnapshot(userId, env, serviceName)
+    : await env.DB.prepare(
+      'SELECT service_name, api_key, base_url, model FROM ai_configs WHERE user_id = ? AND is_active = 1'
+    ).bind(userId).first() as DBUserAIConfigRecord | null) as UserAIConfigSnapshot | DBUserAIConfigRecord | null;
+
+  if (!config) {
+    if (serviceName === 'cloudflare-ai') {
+      return new CloudflareAIProvider(env.AI, overrides?.model);
+    }
+
+    return new CloudflareAIProvider(env.AI, overrides?.model);
+  }
+
+  let apiKey: string | undefined;
+  if ('api_key' in config && typeof config.api_key === 'string' && config.api_key) {
+    try {
+      apiKey = atob(config.api_key as string);
+    } catch {
+      apiKey = config.api_key as string;
+    }
+  } else if ('apiKey' in config && typeof config.apiKey === 'string') {
+    apiKey = config.apiKey;
+  }
+
+  const resolvedServiceName = 'service_name' in config ? config.service_name : config.serviceName;
+  const resolvedBaseUrl: string | undefined = 'base_url' in config
+    ? (typeof config.base_url === 'string' ? config.base_url : undefined)
+    : ((config as UserAIConfigSnapshot).baseUrl || undefined);
+  const resolvedModel: string | undefined = overrides?.model || (
+    'model' in config
+      ? (typeof config.model === 'string' ? config.model : undefined)
+      : ((config as UserAIConfigSnapshot).model || undefined)
+  );
+
+  return createAIProvider(resolvedServiceName, env, {
+    apiKey,
+    baseUrl: resolvedBaseUrl,
+    model: resolvedModel,
   });
 }
