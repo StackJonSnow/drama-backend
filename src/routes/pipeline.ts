@@ -43,6 +43,17 @@ type PipelineLogRecord = {
   created_at: string;
 };
 
+type StreamClient = {
+  writer: WritableStreamDefaultWriter<Uint8Array>;
+  encoder: TextEncoder;
+  closed: boolean;
+  lastLogId: number;
+  lastEpisodeNumber: number;
+};
+
+const streamClients = new Map<string, Set<StreamClient>>();
+let transientLogId = -1;
+
 export const pipelineRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 // JWT认证中间件
@@ -77,8 +88,9 @@ async function appendPipelineLog(
     message: string;
     detail?: string;
   },
-) {
-  await db.prepare(
+): Promise<PipelineLogRecord> {
+  const createdAt = new Date().toISOString();
+  const result = await db.prepare(
     `INSERT INTO pipeline_logs (task_id, level, step_number, step_name, episode_number, message, detail, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
@@ -89,8 +101,136 @@ async function appendPipelineLog(
     entry.episodeNumber ?? null,
     entry.message,
     entry.detail ?? null,
-    new Date().toISOString(),
+    createdAt,
   ).run();
+
+  return {
+    id: Number((result as any).meta?.last_row_id || 0),
+    task_id: taskId,
+    level: entry.level || 'info',
+    step_number: entry.stepNumber ?? null,
+    step_name: entry.stepName ?? null,
+    episode_number: entry.episodeNumber ?? null,
+    message: entry.message,
+    detail: entry.detail ?? null,
+    created_at: createdAt,
+  };
+}
+
+async function sendToClient(client: StreamClient, event: string, data: unknown): Promise<boolean> {
+  if (client.closed) {
+    return false;
+  }
+
+  try {
+    await client.writer.write(
+      client.encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    );
+    return true;
+  } catch {
+    client.closed = true;
+    return false;
+  }
+}
+
+function registerStreamClient(taskId: string, client: StreamClient): void {
+  const clients = streamClients.get(taskId) || new Set<StreamClient>();
+  clients.add(client);
+  streamClients.set(taskId, clients);
+}
+
+function unregisterStreamClient(taskId: string, client: StreamClient): void {
+  const clients = streamClients.get(taskId);
+  if (!clients) {
+    return;
+  }
+
+  clients.delete(client);
+
+  if (clients.size === 0) {
+    streamClients.delete(taskId);
+  }
+}
+
+async function broadcastEvent(
+  taskId: string,
+  event: string,
+  data: unknown,
+  options: { lastLogId?: number; lastEpisodeNumber?: number } = {},
+): Promise<void> {
+  const clients = streamClients.get(taskId);
+
+  if (!clients?.size) {
+    return;
+  }
+
+  await Promise.all(
+    Array.from(clients).map(async (client) => {
+      const sent = await sendToClient(client, event, data);
+
+      if (!sent) {
+        unregisterStreamClient(taskId, client);
+        return;
+      }
+
+      if (typeof options.lastLogId === 'number') {
+        client.lastLogId = Math.max(client.lastLogId, options.lastLogId);
+      }
+
+      if (typeof options.lastEpisodeNumber === 'number') {
+        client.lastEpisodeNumber = Math.max(client.lastEpisodeNumber, options.lastEpisodeNumber);
+      }
+    })
+  );
+}
+
+async function broadcastPipelineLog(taskId: string, log: PipelineLogRecord): Promise<void> {
+  await broadcastEvent(taskId, log.level === 'error' ? 'error' : 'log', {
+    id: log.id,
+    taskId: log.task_id,
+    level: log.level,
+    step: log.step_number,
+    stepName: log.step_name,
+    episodeNumber: log.episode_number,
+    message: log.message,
+    detail: log.detail,
+    timestamp: log.created_at,
+  }, { lastLogId: log.id });
+}
+
+async function broadcastTransientLog(taskId: string, entry: PipelineLogEntry): Promise<void> {
+  const createdAt = new Date().toISOString();
+  const id = transientLogId;
+  transientLogId -= 1;
+
+  await broadcastEvent(taskId, entry.level === 'error' ? 'error' : 'log', {
+    id,
+    taskId,
+    level: entry.level || 'info',
+    step: entry.stepNumber,
+    stepName: entry.stepName,
+    episodeNumber: entry.episodeNumber,
+    message: entry.message,
+    detail: entry.detail,
+    timestamp: createdAt,
+  });
+}
+
+function buildProgressPayload(taskId: string, task: any) {
+  return {
+    taskId,
+    status: task.status,
+    currentStep: task.current_step,
+    totalEpisodes: task.total_episodes,
+    completedEpisodes: task.completed_episodes,
+    stepName: STEP_NAMES[task.current_step as number] || '',
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function getFullTaskMarkdown(db: D1Database, taskId: string): Promise<string> {
@@ -936,12 +1076,13 @@ async function runPipeline(
       totalEpisodes: task.total_episodes as number,
       onStepComplete: async (step: number, name: string, data: any) => {
         stepResults[step] = data;
-        await appendPipelineLog(c.env.DB, taskId, {
+        const log = await appendPipelineLog(c.env.DB, taskId, {
           level: 'success',
           stepNumber: step,
           stepName: name,
           message: `步骤 ${step} 已完成`,
         });
+        await broadcastPipelineLog(taskId, log);
         await c.env.DB.prepare(
           'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
         ).bind(JSON.stringify(data), 'completed', new Date().toISOString(), taskId, step).run();
@@ -951,28 +1092,60 @@ async function runPipeline(
         await c.env.DB.prepare(
           'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
         ).bind(Math.min(step + 1, 8), new Date().toISOString(), taskId).run();
+
+        const refreshedTask = await c.env.DB.prepare(
+          'SELECT status, current_step, total_episodes, completed_episodes FROM generation_tasks WHERE id = ?'
+        ).bind(taskId).first();
+
+        if (refreshedTask) {
+          await broadcastEvent(taskId, 'progress', buildProgressPayload(taskId, refreshedTask));
+        }
       },
-      onEpisodeComplete: async (episodeNumber: number, total: number) => {
-        await appendPipelineLog(c.env.DB, taskId, {
+      onEpisodeComplete: async (episode: {
+        episodeNumber: number;
+        total: number;
+        title: string;
+        contentPreview: string;
+      }) => {
+        const log = await appendPipelineLog(c.env.DB, taskId, {
           level: 'success',
           stepNumber: 7,
           stepName: 'compose',
-          episodeNumber,
-          message: `第${episodeNumber}/${total}集写作完成`,
+          episodeNumber: episode.episodeNumber,
+          message: `第${episode.episodeNumber}/${episode.total}集写作完成`,
         });
+        await broadcastPipelineLog(taskId, log);
+        await broadcastEvent(taskId, 'episode', {
+          episodeNumber: episode.episodeNumber,
+          title: episode.title,
+          contentPreview: episode.contentPreview,
+        }, { lastEpisodeNumber: episode.episodeNumber });
+
+        const refreshedTask = await c.env.DB.prepare(
+          'SELECT status, current_step, total_episodes, completed_episodes FROM generation_tasks WHERE id = ?'
+        ).bind(taskId).first();
+
+        if (refreshedTask) {
+          await broadcastEvent(taskId, 'progress', buildProgressPayload(taskId, refreshedTask));
+        }
       },
       onLog: async (entry: PipelineLogEntry) => {
-        await appendPipelineLog(c.env.DB, taskId, entry);
+        const log = await appendPipelineLog(c.env.DB, taskId, entry);
+        await broadcastPipelineLog(taskId, log);
+      },
+      onLiveLog: async (entry: PipelineLogEntry) => {
+        await broadcastTransientLog(taskId, entry);
       },
       onError: async (step: number, name: string, error: string) => {
         pendingErrors.push({ step, name, message: error });
-        await appendPipelineLog(c.env.DB, taskId, {
+        const log = await appendPipelineLog(c.env.DB, taskId, {
           level: 'error',
           stepNumber: step,
           stepName: name,
           message: `步骤 ${step} 执行失败`,
           detail: error,
         });
+        await broadcastPipelineLog(taskId, log);
       },
     });
 
@@ -1125,23 +1298,44 @@ async function pushSSEUpdates(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   encoder: TextEncoder
 ) {
-  const send = async (event: string, data: any) => {
-    try {
-      await writer.write(
-        encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-      );
-    } catch {
-      // 连接已关闭
-    }
+  const client: StreamClient = {
+    writer,
+    encoder,
+    closed: false,
+    lastLogId: 0,
+    lastEpisodeNumber: 0,
   };
 
-  // 初始推送当前状态
+  registerStreamClient(taskId, client);
+
+  const closeClient = async () => {
+    if (client.closed) {
+      unregisterStreamClient(taskId, client);
+      return;
+    }
+
+    client.closed = true;
+    unregisterStreamClient(taskId, client);
+
+    try {
+      await writer.close();
+    } catch {}
+  };
+
   const task = await c.env.DB.prepare(
     'SELECT * FROM generation_tasks WHERE id = ?'
   ).bind(taskId).first();
 
   if (task) {
-    await send('status', {
+    client.lastEpisodeNumber = Number(task.completed_episodes || 0);
+
+    const latestLog = await c.env.DB.prepare(
+      'SELECT id FROM pipeline_logs WHERE task_id = ? ORDER BY id DESC LIMIT 1'
+    ).bind(taskId).first() as { id?: number } | null;
+
+    client.lastLogId = Number(latestLog?.id || 0);
+
+    await sendToClient(client, 'status', {
       taskId,
       status: task.status,
       currentStep: task.current_step,
@@ -1149,53 +1343,28 @@ async function pushSSEUpdates(
       completedEpisodes: task.completed_episodes,
     });
   }
+  try {
+    const startedAt = Date.now();
 
-  let lastLogId = 0;
-
-  // 推送更新（每2秒检查一次）
-  const interval = setInterval(async () => {
-    try {
+    while (!client.closed && Date.now() - startedAt < 60 * 60 * 1000) {
       const currentTask = await c.env.DB.prepare(
         'SELECT * FROM generation_tasks WHERE id = ?'
       ).bind(taskId).first();
 
       if (!currentTask) {
-        await send('error', { message: '任务不存在' });
-        clearInterval(interval);
-        await writer.close();
-        return;
+        await sendToClient(client, 'error', { message: '任务不存在' });
+        break;
       }
 
-      // 推送状态更新
-      await send('progress', {
-        taskId,
-        status: currentTask.status,
-        currentStep: currentTask.current_step,
-        totalEpisodes: currentTask.total_episodes,
-        completedEpisodes: currentTask.completed_episodes,
-        stepName: STEP_NAMES[currentTask.current_step as number] || '',
-      });
-
-      // 推送最近完成的集数内容
-      const latestEpisode = await c.env.DB.prepare(
-        'SELECT episode_number, title, content FROM episodes WHERE task_id = ? ORDER BY completed_at DESC LIMIT 1'
-      ).bind(taskId).first();
-
-      if (latestEpisode) {
-        await send('episode', {
-          episodeNumber: latestEpisode.episode_number,
-          title: latestEpisode.title,
-          contentPreview: (latestEpisode.content as string)?.substring(0, 200) || '',
-        });
-      }
+      await sendToClient(client, 'progress', buildProgressPayload(taskId, currentTask));
 
       const newLogs = await c.env.DB.prepare(
         'SELECT id, task_id, level, step_number, step_name, episode_number, message, detail, created_at FROM pipeline_logs WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT 100'
-      ).bind(taskId, lastLogId).all();
+      ).bind(taskId, client.lastLogId).all();
 
       if (newLogs.results?.length) {
         for (const log of newLogs.results as PipelineLogRecord[]) {
-          await send(log.level === 'error' ? 'error' : 'log', {
+          const sent = await sendToClient(client, log.level === 'error' ? 'error' : 'log', {
             id: log.id,
             taskId: log.task_id,
             level: log.level,
@@ -1206,13 +1375,17 @@ async function pushSSEUpdates(
             detail: log.detail,
             timestamp: log.created_at,
           });
-          lastLogId = Math.max(lastLogId, log.id);
+
+          if (!sent) {
+            break;
+          }
+
+          client.lastLogId = Math.max(client.lastLogId, log.id);
         }
       }
 
-      // 推送任务级别的错误
       if (currentTask.error_message) {
-        await send('error', {
+        await sendToClient(client, 'error', {
           step: 0,
           stepName: 'task',
           message: currentTask.error_message,
@@ -1220,33 +1393,19 @@ async function pushSSEUpdates(
         });
       }
 
-      // 如果任务已完成或失败，关闭连接
       if (currentTask.status === 'completed' || currentTask.status === 'failed') {
-        await send('done', {
+        await sendToClient(client, 'done', {
           status: currentTask.status,
           message: currentTask.status === 'completed' ? '生成完成' : '生成失败',
         });
-        clearInterval(interval);
-        await writer.close();
+        break;
       }
-    } catch (error) {
-      console.error('SSE推送错误:', error);
-      clearInterval(interval);
-      try { await writer.close(); } catch {}
-    }
-  }, 2000);
 
-  // 连接关闭时清理
-  try {
-    await new Promise((resolve) => {
-      // 60分钟后超时
-      setTimeout(() => {
-        clearInterval(interval);
-        resolve(null);
-      }, 60 * 60 * 1000);
-    });
+      await sleep(5000);
+    }
+  } catch (error) {
+    console.error('SSE推送错误:', error);
   } finally {
-    clearInterval(interval);
-    try { await writer.close(); } catch {}
+    await closeClient();
   }
 }

@@ -25,8 +25,14 @@ export interface PipelineContext {
   totalEpisodes: number;
   abortSignal?: AbortSignal;
   onStepComplete?: (step: number, name: string, data: any) => Promise<void>;
-  onEpisodeComplete?: (episodeNumber: number, total: number) => Promise<void>;
+  onEpisodeComplete?: (episode: {
+    episodeNumber: number;
+    total: number;
+    title: string;
+    contentPreview: string;
+  }) => Promise<void>;
   onLog?: (entry: PipelineLogEntry) => Promise<void> | void;
+  onLiveLog?: (entry: PipelineLogEntry) => Promise<void> | void;
   onError?: (step: number, stepName: string, error: string) => Promise<void>;
 }
 
@@ -111,6 +117,8 @@ async function callAI(
       { role: 'user' as const, content: currentUser },
     ];
 
+    const startedAt = Date.now();
+
     await context.onLog?.({
       level: 'info',
       stepNumber: options.stepNumber,
@@ -120,7 +128,29 @@ async function callAI(
       detail: `system=${currentSystem.length} chars, user=${currentUser.length} chars, jsonMode=${jsonMode}`,
     });
 
+    await context.onLiveLog?.({
+      level: 'info',
+      stepNumber: options.stepNumber,
+      stepName: options.stepName,
+      episodeNumber: options.episodeNumber,
+      message: `[AI Input] ${provider.name} · 尝试 ${attempt}${compressed ? '（压缩上下文）' : ''}`,
+      detail: `[System]\n${currentSystem}\n\n[User]\n${currentUser}`,
+    });
+
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
     try {
+      heartbeatTimer = setInterval(() => {
+        void context.onLiveLog?.({
+          level: 'info',
+          stepNumber: options.stepNumber,
+          stepName: options.stepName,
+          episodeNumber: options.episodeNumber,
+          message: `[AI] ${provider.name} 仍在响应中`,
+          detail: `已等待 ${Math.floor((Date.now() - startedAt) / 1000)} 秒`,
+        });
+      }, 15000);
+
       const aiPromise = provider.chat(messages, {
         maxTokens: compressed ? 4096 : 8192,
         temperature: 0.7,
@@ -138,6 +168,7 @@ async function callAI(
       });
 
       const response = await Promise.race([aiPromise, timeoutPromise]);
+      const elapsedMs = Date.now() - startedAt;
       const usage = response.usage
         ? `tokens=${response.usage.totalTokens} (prompt=${response.usage.promptTokens}, completion=${response.usage.completionTokens})`
         : 'tokens=unknown';
@@ -148,8 +179,17 @@ async function callAI(
         stepNumber: options.stepNumber,
         stepName: options.stepName,
         episodeNumber: options.episodeNumber,
-        message: `[AI] 响应成功 · ${response.content.length} chars · ${usage}`,
+        message: `[AI] 响应成功 · ${response.content.length} chars · ${usage} · 耗时${elapsedMs}ms`,
         detail: preview,
+      });
+
+      await context.onLiveLog?.({
+        level: 'success',
+        stepNumber: options.stepNumber,
+        stepName: options.stepName,
+        episodeNumber: options.episodeNumber,
+        message: `[AI Output] ${provider.name}`,
+        detail: `[Meta]\n耗时: ${elapsedMs}ms\n${usage}\n\n[Content]\n${response.content}`,
       });
 
       if (jsonMode) {
@@ -172,19 +212,24 @@ async function callAI(
 
       return response.content;
     } catch (error) {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
+
       const errorMessage = error instanceof Error ? error.message : String(error);
 
       if (errorMessage === 'PIPELINE_ABORTED') {
         throw error;
       }
 
+      const elapsedMs = Date.now() - startedAt;
       await context.onLog?.({
         level: 'error',
         stepNumber: options.stepNumber,
         stepName: options.stepName,
         episodeNumber: options.episodeNumber,
         message: `[AI] 调用失败 · 尝试 ${attempt}`,
-        detail: errorMessage,
+        detail: `${errorMessage} · 已等待${elapsedMs}ms`,
       });
 
       const normalized = errorMessage.toLowerCase();
@@ -218,6 +263,10 @@ async function callAI(
       });
 
       return runAttempt(attempt + 1, true, compressedSystem, compressedUser);
+    } finally {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
     }
   };
 
@@ -499,7 +548,12 @@ export async function executeStep5To7(
       message: `[Step 7] 第${episode.episodeNumber}集已完成并写入数据库`,
       detail: `内容长度 ${content.length} chars`,
     });
-    await context.onEpisodeComplete?.(episode.episodeNumber, episodes.length);
+    await context.onEpisodeComplete?.({
+      episodeNumber: episode.episodeNumber,
+      total: episodes.length,
+      title: episode.title,
+      contentPreview: content.substring(0, 200),
+    });
   }
 
   await context.db.prepare(
