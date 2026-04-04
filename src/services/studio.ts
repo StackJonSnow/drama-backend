@@ -81,9 +81,9 @@ export async function ensureStudioDefaults(db: D1Database): Promise<void> {
     const now = NOW();
     for (const template of ENTERPRISE_PROMPT_TEMPLATES) {
       await db.prepare(
-        'INSERT INTO prompt_templates (user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, created_at, updated_at) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?, ?)'
-      ).bind(template.node_key, template.name, template.description, template.system_prompt, template.task_instruction, JSON.stringify(template.extra_rules), JSON.stringify(template.model_config), now, now).run();
-    }
+        'INSERT INTO prompt_templates (user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, release_tag, published_at, created_at, updated_at) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?, ?, ?, ?)'
+      ).bind(template.node_key, template.name, template.description, template.system_prompt, template.task_instruction, JSON.stringify(template.extra_rules), JSON.stringify(template.model_config), 'production', now, now, now).run();
+      }
   }
 }
 
@@ -113,7 +113,7 @@ export async function getWorkflowTemplateDetail(db: D1Database, templateId: numb
 export async function listPromptTemplates(db: D1Database, userId: number) {
   await ensureStudioDefaults(db);
   const templates = await db.prepare(
-    'SELECT id, user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, created_at, updated_at FROM prompt_templates WHERE user_id IS NULL OR user_id = ? ORDER BY node_key ASC, is_system DESC, updated_at DESC'
+    'SELECT id, user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, release_tag, published_at, created_at, updated_at FROM prompt_templates WHERE user_id IS NULL OR user_id = ? ORDER BY node_key ASC, is_system DESC, version DESC, updated_at DESC'
   ).bind(userId).all();
   return (templates.results || []).map((template: any) => ({
     ...template,
@@ -121,6 +121,7 @@ export async function listPromptTemplates(db: D1Database, userId: number) {
     model_config: template.model_config ? JSON.parse(template.model_config) : {},
     is_active: Boolean(template.is_active),
     is_system: Boolean(template.is_system),
+    release_tag: template.release_tag || 'draft',
   }));
 }
 

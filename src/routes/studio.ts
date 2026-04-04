@@ -114,10 +114,9 @@ studioRoutes.put('/prompt-templates/:nodeKey', jwtAuth, async (c) => {
   const latest = await c.env.DB.prepare(
     'SELECT version FROM prompt_templates WHERE node_key = ? AND user_id = ? ORDER BY version DESC LIMIT 1'
   ).bind(nodeKey, Number(payload.userId)).first<any>();
-  await c.env.DB.prepare('UPDATE prompt_templates SET is_active = 0 WHERE node_key = ? AND user_id = ?').bind(nodeKey, Number(payload.userId)).run();
   await c.env.DB.prepare(
-    `INSERT INTO prompt_templates (user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)`
+    `INSERT INTO prompt_templates (user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, release_tag, published_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, NULL, ?, ?)`
   ).bind(
     Number(payload.userId),
     nodeKey,
@@ -128,11 +127,99 @@ studioRoutes.put('/prompt-templates/:nodeKey', jwtAuth, async (c) => {
     JSON.stringify(body.extra_rules || []),
     JSON.stringify(body.model_config || {}),
     Number(latest?.version || 0) + 1,
+    'draft',
     now,
     now,
   ).run();
   const templates = await listPromptTemplates(c.env.DB, Number(payload.userId));
   return c.json({ success: true, message: '提示词模板已更新', data: { templates } });
+});
+
+studioRoutes.post('/prompt-templates/:nodeKey/publish', jwtAuth, async (c) => {
+  const payload = c.get('jwtPayload');
+  const nodeKey = c.req.param('nodeKey');
+  const body = await c.req.json().catch(() => ({}));
+  const templateId = Number(body.templateId || 0);
+  const releaseTag = typeof body.releaseTag === 'string' ? body.releaseTag : 'production';
+  const now = new Date().toISOString();
+
+  const selected = await c.env.DB.prepare(
+    'SELECT * FROM prompt_templates WHERE id = ? AND node_key = ? AND (user_id = ? OR user_id IS NULL)'
+  ).bind(templateId, nodeKey, Number(payload.userId)).first<any>();
+
+  if (!selected) {
+    return c.json({ success: false, error: '提示词模板不存在' }, 404);
+  }
+
+  const latest = await c.env.DB.prepare(
+    'SELECT version FROM prompt_templates WHERE node_key = ? AND user_id = ? ORDER BY version DESC LIMIT 1'
+  ).bind(nodeKey, Number(payload.userId)).first<any>();
+
+  await c.env.DB.prepare('UPDATE prompt_templates SET is_active = 0 WHERE node_key = ? AND user_id = ?').bind(nodeKey, Number(payload.userId)).run();
+  await c.env.DB.prepare(
+    `INSERT INTO prompt_templates (user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, release_tag, published_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)`
+  ).bind(
+    Number(payload.userId),
+    nodeKey,
+    selected.name,
+    selected.description,
+    selected.system_prompt,
+    selected.task_instruction,
+    selected.extra_rules,
+    selected.model_config,
+    Number(latest?.version || 0) + 1,
+    releaseTag,
+    now,
+    now,
+    now,
+  ).run();
+
+  const templates = await listPromptTemplates(c.env.DB, Number(payload.userId));
+  return c.json({ success: true, message: '提示词模板已发布', data: { templates } });
+});
+
+studioRoutes.post('/prompt-templates/:nodeKey/rollback', jwtAuth, async (c) => {
+  const payload = c.get('jwtPayload');
+  const nodeKey = c.req.param('nodeKey');
+  const body = await c.req.json().catch(() => ({}));
+  const templateId = Number(body.templateId || 0);
+  const now = new Date().toISOString();
+
+  const selected = await c.env.DB.prepare(
+    'SELECT * FROM prompt_templates WHERE id = ? AND node_key = ? AND (user_id = ? OR user_id IS NULL)'
+  ).bind(templateId, nodeKey, Number(payload.userId)).first<any>();
+
+  if (!selected) {
+    return c.json({ success: false, error: '回滚版本不存在' }, 404);
+  }
+
+  const latest = await c.env.DB.prepare(
+    'SELECT version FROM prompt_templates WHERE node_key = ? AND user_id = ? ORDER BY version DESC LIMIT 1'
+  ).bind(nodeKey, Number(payload.userId)).first<any>();
+
+  await c.env.DB.prepare('UPDATE prompt_templates SET is_active = 0 WHERE node_key = ? AND user_id = ?').bind(nodeKey, Number(payload.userId)).run();
+  await c.env.DB.prepare(
+    `INSERT INTO prompt_templates (user_id, node_key, name, description, system_prompt, task_instruction, extra_rules, model_config, is_active, is_system, version, release_tag, published_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)`
+  ).bind(
+    Number(payload.userId),
+    nodeKey,
+    selected.name,
+    selected.description,
+    selected.system_prompt,
+    selected.task_instruction,
+    selected.extra_rules,
+    selected.model_config,
+    Number(latest?.version || 0) + 1,
+    'production',
+    now,
+    now,
+    now,
+  ).run();
+
+  const templates = await listPromptTemplates(c.env.DB, Number(payload.userId));
+  return c.json({ success: true, message: '已回滚并发布所选版本', data: { templates } });
 });
 
 studioRoutes.post('/prompt-templates/:nodeKey/reset', jwtAuth, async (c) => {
