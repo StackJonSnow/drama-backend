@@ -3,6 +3,8 @@ import { verify } from 'hono/jwt';
 import type { Context, Next } from 'hono';
 import { getAIServiceCatalog, getAIServiceDefinition } from '../services/ai-catalog';
 import { validateAIConnection } from '../services/ai-validation';
+import { getUserAIProvider } from '../services/ai-provider';
+import { ensureServiceReadyForGeneration } from '../services/ai-access';
 
 type Bindings = {
   DB: D1Database;
@@ -308,6 +310,92 @@ aiRoutes.post('/test', jwtAuth, async (c) => {
   } catch (error) {
     console.error('测试AI服务错误:', error);
     return c.json({ success: false, error: '服务器内部错误' }, 500);
+  }
+});
+
+aiRoutes.post('/project-autofill', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const body = await c.req.json();
+    const genre = typeof body.genre === 'string' ? body.genre.trim() : '';
+    const scriptType = typeof body.script_type === 'string' ? body.script_type.trim() : '';
+    const aiService = typeof body.ai_service === 'string' ? body.ai_service.trim() : 'cloudflare-ai';
+    const generationMode = typeof body.generation_mode === 'string' ? body.generation_mode.trim() : 'balanced';
+
+    if (!genre || !scriptType) {
+      return c.json({ success: false, error: '题材和类型是必填项' }, 400);
+    }
+
+    if (aiService !== 'cloudflare-ai') {
+      await ensureServiceReadyForGeneration(c.env.DB, Number(payload.userId), aiService);
+    }
+
+    const provider = await getUserAIProvider(Number(payload.userId), c.env as any, aiService);
+    const modePrompt = generationMode === 'conservative'
+      ? '整体方向偏稳健、市场友好、平台适配优先，避免过度猎奇。'
+      : generationMode === 'wild'
+        ? '整体方向偏高概念、强钩子、脑洞大、设定感强，允许更大胆的创意和反转。'
+        : '整体方向兼顾市场可看性与创意新鲜感，保持平衡。';
+    const response = await provider.chat([
+      {
+        role: 'system',
+        content: [
+          '你是一位网剧/短剧项目策划专家与制片开发顾问。',
+          '用户只提供题材和类型，你需要自动补全一个可直接用于项目创建的创意包。',
+          '输出必须严格为 JSON，不得输出解释性文字。',
+          '内容要有商业感、可拍性、戏剧冲突和平台适配感。',
+          modePrompt,
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          `题材：${genre}`,
+          `类型：${scriptType}`,
+          `生成模式：${generationMode}`,
+          '',
+          '请自动生成并返回以下字段：',
+          '- title: 剧本标题',
+          '- style: 风格',
+          '- target_platform: 目标平台',
+          '- target_duration: 单集时长（整数）',
+          '- total_episodes: 总集数（整数）',
+          '- character_count: 角色数量（整数）',
+          '- key_points: 5-8 条关键情节点数组',
+          '- characters_input: 4-7 条角色设定数组',
+          '- scene_input: 世界观/场景背景描述',
+          '',
+          '要求：',
+          '1. 直接可填充创作参数',
+          '2. 标题要具体，不要泛泛而谈',
+          '3. 角色设定每条都包含姓名、身份、核心矛盾',
+          '4. key_points 必须是剧情推进点，不要写空泛主题',
+          '',
+          '输出 JSON 结构：',
+          JSON.stringify({
+            title: '标题',
+            style: '风格',
+            target_platform: '平台',
+            target_duration: 15,
+            total_episodes: 60,
+            character_count: 6,
+            key_points: ['关键情节点'],
+            characters_input: ['角色设定'],
+            scene_input: '背景描述',
+          }, null, 2),
+        ].join('\n'),
+      },
+    ], {
+      jsonMode: true,
+      maxTokens: 1800,
+      temperature: 0.85,
+    });
+
+    const parsed = JSON.parse(response.content);
+    return c.json({ success: true, data: { suggestion: parsed } });
+  } catch (error) {
+    console.error('项目参数智能填充错误:', error);
+    return c.json({ success: false, error: error instanceof Error ? error.message : '智能填充失败' }, 500);
   }
 });
 
