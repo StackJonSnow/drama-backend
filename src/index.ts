@@ -4,6 +4,7 @@ import { authRoutes } from './routes/auth';
 import { scriptRoutes } from './routes/scripts';
 import { aiRoutes } from './routes/ai';
 import { pipelineRoutes } from './routes/pipeline';
+import { studioRoutes } from './routes/studio';
 
 // 定义环境变量类型
 type Bindings = {
@@ -32,6 +33,7 @@ app.route('/api/auth', authRoutes);
 app.route('/api/scripts', scriptRoutes);
 app.route('/api/ai', aiRoutes);
 app.route('/api/pipeline', pipelineRoutes);
+app.route('/api/studio', studioRoutes);
 
 // 健康检查
 app.get('/', (c) => {

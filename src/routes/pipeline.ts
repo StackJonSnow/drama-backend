@@ -4,6 +4,7 @@ import type { Context, Next } from 'hono';
 import { AIServiceAccessError, ensureServiceReadyForGeneration } from '../services/ai-access';
 import { getUserAIConfigSnapshot, getUserAIProvider } from '../services/ai-provider';
 import { getAIServiceDefinition } from '../services/ai-catalog';
+import { ensureStudioDefaults, getWorkflowTemplateDetail, listWorkflowTemplates } from '../services/studio';
 import {
   executePipelinePhase1,
   executePipelinePhase2,
@@ -53,6 +54,7 @@ type StreamClient = {
 };
 
 const streamClients = new Map<string, Set<StreamClient>>();
+const taskAbortControllers = new Map<string, AbortController>();
 let transientLogId = -1;
 
 export const pipelineRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
@@ -263,6 +265,37 @@ async function resolveTaskAISelection(
   };
 }
 
+async function resolveWorkflowTemplateForTask(
+  db: D1Database,
+  userId: number,
+  workflowTemplateId?: number,
+) {
+  await ensureStudioDefaults(db);
+  if (workflowTemplateId) {
+    const detail = await getWorkflowTemplateDetail(db, workflowTemplateId, userId);
+    if (!detail) {
+      throw new Error('工作流模板不存在');
+    }
+    return detail;
+  }
+
+  const templates = await listWorkflowTemplates(db, userId) as any[];
+  const selected = templates.find((item) => Number(item.user_id) === userId && Number(item.is_default) === 1)
+    || templates.find((item) => Number(item.is_system) === 1 && Number(item.is_default) === 1)
+    || templates[0];
+
+  if (!selected) {
+    throw new Error('未找到可用工作流模板');
+  }
+
+  const detail = await getWorkflowTemplateDetail(db, Number(selected.id), userId);
+  if (!detail) {
+    throw new Error('未找到可用工作流模板');
+  }
+
+  return detail;
+}
+
 async function getFullTaskMarkdown(db: D1Database, taskId: string): Promise<string> {
   const task = await db.prepare(
     'SELECT * FROM generation_tasks WHERE id = ?'
@@ -302,6 +335,26 @@ async function getFullTaskMarkdown(db: D1Database, taskId: string): Promise<stri
   return markdown;
 }
 
+function buildLineDiff(baseContent: string, targetContent: string) {
+  const baseLines = baseContent.split('\n');
+  const targetLines = targetContent.split('\n');
+  const max = Math.max(baseLines.length, targetLines.length);
+  const diff: Array<{ type: 'same' | 'added' | 'removed' | 'changed'; baseLine?: string; targetLine?: string; lineNumber: number }> = [];
+  for (let i = 0; i < max; i += 1) {
+    const baseLine = baseLines[i];
+    const targetLine = targetLines[i];
+    const type = baseLine === targetLine
+      ? 'same'
+      : baseLine == null
+        ? 'added'
+        : targetLine == null
+          ? 'removed'
+          : 'changed';
+    diff.push({ type, baseLine, targetLine, lineNumber: i + 1 });
+  }
+  return diff;
+}
+
 /**
  * POST /api/pipeline/start
  * 创建新的生成任务并开始流水线
@@ -314,7 +367,7 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
     const {
       title, genre, script_type, style, target_platform,
       target_duration, character_count, key_points,
-      characters_input, scene_input, ai_service, total_episodes,
+      characters_input, scene_input, ai_service, total_episodes, workflow_template_id,
     } = body;
 
     if (!title || !genre || !script_type) {
@@ -326,6 +379,7 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       c.env,
       ai_service || 'cloudflare-ai',
     );
+    const workflowTemplate = await resolveWorkflowTemplateForTask(c.env.DB, Number(payload.userId), workflow_template_id ? Number(workflow_template_id) : undefined);
 
     const taskId = generateTaskId();
     const now = new Date().toISOString();
@@ -335,8 +389,8 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       INSERT INTO generation_tasks (
         id, user_id, title, genre, script_type, style, target_platform,
         target_duration, character_count, key_points, characters_input,
-        scene_input, ai_service, ai_model, total_episodes, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+        scene_input, ai_service, ai_model, workflow_template_id, workflow_snapshot, total_episodes, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
     `).bind(
       taskId,
       payload.userId,
@@ -352,6 +406,8 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       scene_input || null,
       aiSelection.serviceName,
       aiSelection.model,
+      Number((workflowTemplate as any).id),
+      JSON.stringify(workflowTemplate.nodes || []),
       total_episodes || 50,
       now
     ).run();
@@ -464,6 +520,8 @@ pipelineRoutes.post('/:id/pause', jwtAuth, async (c) => {
     await c.env.DB.prepare(
       'UPDATE generation_tasks SET status = ?, updated_at = ? WHERE id = ?'
     ).bind('paused', new Date().toISOString(), taskId).run();
+
+    taskAbortControllers.get(taskId)?.abort(new Error('PIPELINE_ABORTED'));
 
     return c.json({
       success: true,
@@ -804,6 +862,113 @@ pipelineRoutes.get('/:id/versions/:versionId', jwtAuth, async (c) => {
   }
 });
 
+pipelineRoutes.post('/:id/versions/compare', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id') || '';
+    const body = await c.req.json().catch(() => ({}));
+    const baseVersionId = Number(body.baseVersionId || 0);
+    const targetVersionId = Number(body.targetVersionId || 0);
+
+    const task = await c.env.DB.prepare('SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?').bind(taskId, payload.userId).first();
+    if (!task) return c.json({ success: false, error: '任务不存在' }, 404);
+
+    const [baseVersion, targetVersion] = await Promise.all([
+      c.env.DB.prepare('SELECT id, version, label, content, created_at FROM script_versions WHERE id = ? AND task_id = ?').bind(baseVersionId, taskId).first<any>(),
+      c.env.DB.prepare('SELECT id, version, label, content, created_at FROM script_versions WHERE id = ? AND task_id = ?').bind(targetVersionId, taskId).first<any>(),
+    ]);
+
+    if (!baseVersion || !targetVersion) {
+      return c.json({ success: false, error: '对比版本不存在' }, 404);
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        baseVersion,
+        targetVersion,
+        diff: buildLineDiff(baseVersion.content || '', targetVersion.content || ''),
+      },
+    });
+  } catch (error) {
+    console.error('版本对比错误:', error);
+    return c.json({ success: false, error: '版本对比失败' }, 500);
+  }
+});
+
+pipelineRoutes.get('/:id/editor', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id') || '';
+    const task = await c.env.DB.prepare('SELECT id, title FROM generation_tasks WHERE id = ? AND user_id = ?').bind(taskId, payload.userId).first<any>();
+    if (!task) return c.json({ success: false, error: '任务不存在' }, 404);
+
+    const draft = await c.env.DB.prepare('SELECT id, title, content, source_version_id, updated_at FROM script_drafts WHERE task_id = ? AND user_id = ?').bind(taskId, payload.userId).first<any>();
+    const latestVersion = await c.env.DB.prepare('SELECT id, version, label, content, created_at FROM script_versions WHERE task_id = ? ORDER BY version DESC LIMIT 1').bind(taskId).first<any>();
+    const fallbackContent = latestVersion?.content || await getFullTaskMarkdown(c.env.DB, taskId).catch(() => '');
+
+    return c.json({
+      success: true,
+      data: {
+        draft: draft || null,
+        content: draft?.content || fallbackContent,
+        title: draft?.title || task.title,
+        sourceVersion: latestVersion || null,
+      },
+    });
+  } catch (error) {
+    console.error('获取编辑器内容错误:', error);
+    return c.json({ success: false, error: '获取编辑器内容失败' }, 500);
+  }
+});
+
+pipelineRoutes.put('/:id/editor', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id') || '';
+    const body = await c.req.json();
+    const task = await c.env.DB.prepare('SELECT id FROM generation_tasks WHERE id = ? AND user_id = ?').bind(taskId, payload.userId).first();
+    if (!task) return c.json({ success: false, error: '任务不存在' }, 404);
+
+    const now = new Date().toISOString();
+    const existing = await c.env.DB.prepare('SELECT id FROM script_drafts WHERE task_id = ? AND user_id = ?').bind(taskId, payload.userId).first<any>();
+    if (existing) {
+      await c.env.DB.prepare('UPDATE script_drafts SET title = ?, content = ?, source_version_id = ?, updated_at = ? WHERE id = ?').bind(body.title || null, body.content || '', body.sourceVersionId || null, now, existing.id).run();
+    } else {
+      await c.env.DB.prepare('INSERT INTO script_drafts (task_id, user_id, title, content, source_version_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(taskId, payload.userId, body.title || null, body.content || '', body.sourceVersionId || null, now, now).run();
+    }
+    return c.json({ success: true, message: '草稿已保存' });
+  } catch (error) {
+    console.error('保存草稿错误:', error);
+    return c.json({ success: false, error: '保存草稿失败' }, 500);
+  }
+});
+
+pipelineRoutes.post('/:id/editor/publish', jwtAuth, async (c) => {
+  try {
+    const payload = c.get('jwtPayload');
+    const taskId = c.req.param('id') || '';
+    const body = await c.req.json().catch(() => ({}));
+    const task = await c.env.DB.prepare('SELECT id, title FROM generation_tasks WHERE id = ? AND user_id = ?').bind(taskId, payload.userId).first<any>();
+    if (!task) return c.json({ success: false, error: '任务不存在' }, 404);
+
+    const draft = await c.env.DB.prepare('SELECT title, content FROM script_drafts WHERE task_id = ? AND user_id = ?').bind(taskId, payload.userId).first<any>();
+    const content = body.content || draft?.content;
+    if (!content) return c.json({ success: false, error: '没有可发布内容' }, 400);
+
+    const latestVersion = await c.env.DB.prepare('SELECT version FROM script_versions WHERE task_id = ? ORDER BY version DESC LIMIT 1').bind(taskId).first<any>();
+    const nextVersion = Number(latestVersion?.version || 0) + 1;
+    const label = body.label || `编辑版 ${nextVersion}`;
+    const now = new Date().toISOString();
+    const result = await c.env.DB.prepare('INSERT INTO script_versions (task_id, version, label, content, change_notes, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(taskId, nextVersion, label, content, body.changeNotes || '来自剧本编辑器发布', now).run();
+    const version = await c.env.DB.prepare('SELECT id, task_id, version, label, content, change_notes, created_at FROM script_versions WHERE id = ?').bind((result as any).meta?.last_row_id).first<any>();
+    return c.json({ success: true, message: '已发布为新版本', data: { version } });
+  } catch (error) {
+    console.error('发布编辑版本错误:', error);
+    return c.json({ success: false, error: '发布失败' }, 500);
+  }
+});
+
 /**
  * POST /api/pipeline/:id/versions
  * 创建任务版本快照
@@ -1091,6 +1256,10 @@ async function runPipeline(
   userId: number
 ) {
   const pendingErrors: { step: number; name: string; message: string }[] = [];
+  const abortController = new AbortController();
+
+  taskAbortControllers.get(taskId)?.abort(new Error('PIPELINE_ABORTED'));
+  taskAbortControllers.set(taskId, abortController);
 
   try {
     // 获取任务信息
@@ -1134,6 +1303,11 @@ async function runPipeline(
     }
 
     const currentStep = task.current_step as number;
+    const workflowSnapshot = task.workflow_snapshot ? JSON.parse(task.workflow_snapshot as string) : null;
+    const orderedWorkflowNodes = (Array.isArray(workflowSnapshot) ? workflowSnapshot : []).filter((node: any) => node.enabled !== false).sort((a: any, b: any) => Number(a.execution_order) - Number(b.execution_order));
+    const orderedPhase1 = orderedWorkflowNodes.filter((node: any) => Number(node.step_number) <= 4).map((node: any) => Number(node.step_number));
+    const orderedLoop = orderedWorkflowNodes.filter((node: any) => Number(node.step_number) >= 5 && Number(node.step_number) <= 7).map((node: any) => Number(node.step_number));
+    const evaluateEnabled = orderedWorkflowNodes.length === 0 || orderedWorkflowNodes.some((node: any) => Number(node.step_number) === 8);
 
     // 构建上下文
     const buildContext = () => ({
@@ -1143,6 +1317,7 @@ async function runPipeline(
       provider,
       db: c.env.DB,
       totalEpisodes: task.total_episodes as number,
+      abortSignal: abortController.signal,
       onStepComplete: async (step: number, name: string, data: any) => {
         stepResults[step] = data;
         const log = await appendPipelineLog(c.env.DB, taskId, {
@@ -1228,14 +1403,16 @@ async function runPipeline(
     if (currentStep < 4) {
       const context = buildContext();
 
-      const STEP_CONFIG: { num: number; fn: () => Promise<any> }[] = [
-        { num: 1, fn: () => executeStep1(context) },
-        { num: 2, fn: () => executeStep2(context, stepResults[1]) },
-        { num: 3, fn: () => executeStep3(context, stepResults[1], stepResults[2]) },
-        { num: 4, fn: () => executeStep4(context, stepResults[1], stepResults[3]) },
-      ];
+      const stepExecutorMap: Record<number, () => Promise<any>> = {
+        1: () => executeStep1(context),
+        2: () => executeStep2(context, stepResults[1]),
+        3: () => executeStep3(context, stepResults[1], stepResults[2]),
+        4: () => executeStep4(context, stepResults[1], stepResults[3]),
+      };
 
-      for (const { num, fn } of STEP_CONFIG) {
+      for (const num of (orderedPhase1.length ? orderedPhase1 : [1, 2, 3, 4])) {
+        const fn = stepExecutorMap[num];
+        if (!fn) continue;
         if (stepResults[num]) continue; // 已完成则跳过
 
         // 检查任务是否被暂停
@@ -1255,6 +1432,9 @@ async function runPipeline(
           stepResults[num] = await fn();
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
+          if (errMsg === 'PIPELINE_ABORTED') {
+            return;
+          }
           console.error(`[${taskId}] Step ${num} 失败:`, errMsg);
 
           // 更新步骤状态为失败
@@ -1286,42 +1466,50 @@ async function runPipeline(
     const context2 = buildContext();
 
     try {
-      await executePipelinePhase2(context2, stepResults[1], stepResults[2], stepResults[4]);
+      await executePipelinePhase2(context2, stepResults[1], stepResults[2], stepResults[4], orderedLoop.length ? orderedLoop : [5, 6, 7]);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg === 'PIPELINE_ABORTED') {
+        return;
+      }
       console.error(`[${taskId}] Phase 2 失败:`, errMsg);
       pendingErrors.push({ step: 5, name: 'scenes/dialogue/compose', message: errMsg });
     }
 
     // Phase 3: 步骤 8（评分）
-    await c.env.DB.prepare(
-      'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
-    ).bind('running', new Date().toISOString(), taskId, 8).run();
-
-    try {
-      const score = await executePipelinePhase3(context2, stepResults[1]);
-
-      if (score) {
-        await c.env.DB.prepare(
-          'INSERT INTO scores (task_id, plot_score, dialogue_score, character_score, pacing_score, creativity_score, overall_score, suggestions, evaluated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-        ).bind(
-          taskId,
-          score.plot?.score || 0, score.dialogue?.score || 0, score.character?.score || 0,
-          score.pacing?.score || 0, score.creativity?.score || 0, score.overall || 0,
-          JSON.stringify(score.suggestions || []), new Date().toISOString()
-        ).run();
-
-        await c.env.DB.prepare(
-          'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
-        ).bind(JSON.stringify(score), 'completed', new Date().toISOString(), taskId, 8).run();
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[${taskId}] Step 8 评分失败:`, errMsg);
-      pendingErrors.push({ step: 8, name: 'evaluate', message: errMsg });
+    if (evaluateEnabled) {
       await c.env.DB.prepare(
-        'UPDATE pipeline_steps SET status = ?, error_message = ? WHERE task_id = ? AND step_number = ?'
-      ).bind('failed', errMsg, taskId, 8).run();
+        'UPDATE pipeline_steps SET status = ?, started_at = ? WHERE task_id = ? AND step_number = ?'
+      ).bind('running', new Date().toISOString(), taskId, 8).run();
+
+      try {
+        const score = await executePipelinePhase3(context2, stepResults[1]);
+
+        if (score) {
+          await c.env.DB.prepare(
+            'INSERT INTO scores (task_id, plot_score, dialogue_score, character_score, pacing_score, creativity_score, overall_score, suggestions, evaluated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          ).bind(
+            taskId,
+            score.plot?.score || 0, score.dialogue?.score || 0, score.character?.score || 0,
+            score.pacing?.score || 0, score.creativity?.score || 0, score.overall || 0,
+            JSON.stringify(score.suggestions || []), new Date().toISOString()
+          ).run();
+
+          await c.env.DB.prepare(
+            'UPDATE pipeline_steps SET content = ?, status = ?, completed_at = ? WHERE task_id = ? AND step_number = ?'
+          ).bind(JSON.stringify(score), 'completed', new Date().toISOString(), taskId, 8).run();
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg === 'PIPELINE_ABORTED') {
+          return;
+        }
+        console.error(`[${taskId}] Step 8 评分失败:`, errMsg);
+        pendingErrors.push({ step: 8, name: 'evaluate', message: errMsg });
+        await c.env.DB.prepare(
+          'UPDATE pipeline_steps SET status = ?, error_message = ? WHERE task_id = ? AND step_number = ?'
+        ).bind('failed', errMsg, taskId, 8).run();
+      }
     }
 
     // 标记任务完成（即使有部分非关键错误）
@@ -1360,6 +1548,11 @@ async function runPipeline(
     await c.env.DB.prepare(
       'UPDATE generation_tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?'
     ).bind('failed', (error as Error).message, new Date().toISOString(), taskId).run();
+  } finally {
+    const activeController = taskAbortControllers.get(taskId);
+    if (activeController === abortController) {
+      taskAbortControllers.delete(taskId);
+    }
   }
 }
 
