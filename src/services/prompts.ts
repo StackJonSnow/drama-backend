@@ -22,6 +22,16 @@ export interface PromptPackage {
   currentTaskSummary: string;
 }
 
+export interface PromptTemplateOverride {
+  system_prompt?: string;
+  task_instruction?: string;
+  extra_rules?: string[];
+  model_config?: {
+    temperature?: number;
+    maxTokens?: number;
+  };
+}
+
 const GENRE_MAP: Record<string, string> = {
   'sci-fi': '科幻', 'romance': '爱情', 'action': '动作',
   'comedy': '喜剧', 'drama': '剧情', 'horror': '恐怖',
@@ -95,6 +105,18 @@ function buildTaskDrivenUserPrompt(options: {
     '[输出格式（严格JSON）]',
     options.outputFormat,
   ].join('\n');
+}
+
+function resolvePromptParts(base: {
+  system: string;
+  taskInstruction: string;
+  extraRules?: string[];
+}, template?: PromptTemplateOverride) {
+  return {
+    system: template?.system_prompt?.trim() || base.system,
+    taskInstruction: template?.task_instruction?.trim() || base.taskInstruction,
+    extraRules: template?.extra_rules?.length ? template.extra_rules : (base.extraRules || []),
+  };
 }
 
 function summarizeCharacters(characters: any): string {
@@ -182,7 +204,7 @@ function summarizeDialogues(dialogues: any[]): string {
 // ============================================
 // Step 1: Story Outline
 // ============================================
-export function storyOutlinePrompt(input: TaskInput): PromptPackage {
+export function storyOutlinePrompt(input: TaskInput, template?: PromptTemplateOverride): PromptPackage {
   const genre = genreLabel(input.genre);
   const type = typeLabel(input.scriptType);
   const totalEps = input.totalEpisodes || 50;
@@ -206,8 +228,7 @@ export function storyOutlinePrompt(input: TaskInput): PromptPackage {
     ], '\n'),
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位拥有20年从业经验的资深编剧和故事策划，曾参与多部院线电影和长篇电视剧的创作。',
       '你的专长是构建具有商业价值和艺术深度的故事框架。',
@@ -220,9 +241,15 @@ export function storyOutlinePrompt(input: TaskInput): PromptPackage {
       '',
       '输出要求：仅输出JSON，不输出任何解释性文字。JSON必须可被标准解析器直接解析。',
     ].join('\n'),
+    taskInstruction: '请基于当前任务摘要，创作完整故事大纲，确保主题、核心冲突、世界观与三幕式结构清晰闭环。',
+    extraRules: ['优先保留用户指定角色与关键情节点，不要发散到无关支线'],
+  }, template);
 
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
     user: buildTaskDrivenUserPrompt({
-      taskInstruction: '请基于当前任务摘要，创作完整故事大纲，确保主题、核心冲突、世界观与三幕式结构清晰闭环。',
+      taskInstruction: promptParts.taskInstruction,
       currentTaskSummary,
       outputFormat: JSON.stringify({
         title: '项目标题',
@@ -239,7 +266,7 @@ export function storyOutlinePrompt(input: TaskInput): PromptPackage {
           act3: { name: '第三幕：结局', description: '高潮对决、主题升华、最终落幕', keyEvents: ['最终对决', '主题呼应', '结局'] },
         },
       }, null, 2),
-      extraRules: ['优先保留用户指定角色与关键情节点，不要发散到无关支线'],
+      extraRules: promptParts.extraRules,
     }),
   };
 }
@@ -247,7 +274,7 @@ export function storyOutlinePrompt(input: TaskInput): PromptPackage {
 // ============================================
 // Step 2: Character Generation
 // ============================================
-export function characterGenerationPrompt(input: TaskInput, storyOutline: any): PromptPackage {
+export function characterGenerationPrompt(input: TaskInput, storyOutline: any, template?: PromptTemplateOverride): PromptPackage {
   const charCount = input.characterCount || 6;
   const currentTaskSummary = buildCurrentTaskSummary({
     globalSummary: joinNonEmpty([
@@ -267,8 +294,7 @@ export function characterGenerationPrompt(input: TaskInput, storyOutline: any): 
     ], '\n'),
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位专业的角色设计师和心理学家，擅长创造立体、有深度、有弧线的角色。',
       '你设计的角色必须：',
@@ -279,9 +305,15 @@ export function characterGenerationPrompt(input: TaskInput, storyOutline: any): 
       '',
       '输出要求：仅输出JSON，不输出任何解释性文字。',
     ].join('\n'),
+    taskInstruction: '请基于当前任务摘要，设计恰好指定数量的主要角色，重点保持人物目标、关系张力、功能分工和反派动机自洽。',
+    extraRules: ['优先保留人物状态、目标、冲突与关键设定，不要复述无关世界观细节'],
+  }, template);
 
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
     user: buildTaskDrivenUserPrompt({
-      taskInstruction: '请基于当前任务摘要，设计恰好指定数量的主要角色，重点保持人物目标、关系张力、功能分工和反派动机自洽。',
+      taskInstruction: promptParts.taskInstruction,
       currentTaskSummary,
       outputFormat: JSON.stringify({
         protagonist: {
@@ -304,7 +336,7 @@ export function characterGenerationPrompt(input: TaskInput, storyOutline: any): 
           tension: '潜在冲突点', evolution: '关系变化轨迹',
         }],
       }, null, 2),
-      extraRules: ['优先保留人物状态、目标、冲突与关键设定，不要复述无关世界观细节'],
+      extraRules: promptParts.extraRules,
     }),
   };
 }
@@ -312,7 +344,7 @@ export function characterGenerationPrompt(input: TaskInput, storyOutline: any): 
 // ============================================
 // Step 3: Plot Structure
 // ============================================
-export function plotStructurePrompt(input: TaskInput, storyOutline: any, characters: any): PromptPackage {
+export function plotStructurePrompt(input: TaskInput, storyOutline: any, characters: any, template?: PromptTemplateOverride): PromptPackage {
   const act1Scenes = 5;
   const act2Scenes = 10;
   const act3Scenes = 5;
@@ -333,8 +365,7 @@ export function plotStructurePrompt(input: TaskInput, storyOutline: any, charact
     ], '\n'),
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位资深编剧行业的结构专家，精通好莱坞三幕式叙事结构。',
       '你设计的剧情结构必须：',
@@ -344,9 +375,14 @@ export function plotStructurePrompt(input: TaskInput, storyOutline: any, charact
       '',
       '输出要求：仅输出JSON，不要输出超过20个场景。',
     ].join('\n'),
+    taskInstruction: `请生成高层级剧情结构：第一幕约${act1Scenes}场、第二幕约${act2Scenes}场、第三幕约${act3Scenes}场，确保场景之间有清晰因果链和转折。`,
+  }, template);
 
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
     user: buildTaskDrivenUserPrompt({
-      taskInstruction: `请生成高层级剧情结构：第一幕约${act1Scenes}场、第二幕约${act2Scenes}场、第三幕约${act3Scenes}场，确保场景之间有清晰因果链和转折。`,
+      taskInstruction: promptParts.taskInstruction,
       currentTaskSummary,
       outputFormat: JSON.stringify({
         act1: { scenes: [{ sceneNumber: 1, name: '场景名', location: '地点', time: '时间', characters: ['角色名'], description: '场景描述（80字）', purpose: '叙事功能', emotion: '情绪基调', conflict: '冲突点' }] },
@@ -355,6 +391,7 @@ export function plotStructurePrompt(input: TaskInput, storyOutline: any, charact
         totalScenes: 20,
         turningPoints: [{ sceneNumber: 5, description: '转折点描述' }],
       }, null, 2),
+      extraRules: promptParts.extraRules,
     }),
   };
 }
@@ -362,7 +399,7 @@ export function plotStructurePrompt(input: TaskInput, storyOutline: any, charact
 // ============================================
 // Step 4: Episode Planning
 // ============================================
-export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotStructure: any, totalEpisodes: number): PromptPackage {
+export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotStructure: any, totalEpisodes: number, template?: PromptTemplateOverride): PromptPackage {
   const act1End = Math.floor(totalEpisodes * 0.2);
   const act2End = Math.floor(totalEpisodes * 0.75);
 
@@ -380,8 +417,7 @@ export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotS
     ], '\n'),
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位经验丰富的电视剧总编剧，擅长将长篇叙事拆分为引人入胜的分集结构。',
       '你的分集策略必须：',
@@ -392,9 +428,14 @@ export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotS
       '',
       `输出要求：仅输出JSON，episodes数组必须恰好包含 ${totalEpisodes} 项。`,
     ].join('\n'),
+    taskInstruction: `请把故事拆分为恰好${totalEpisodes}集的分集计划，并明确每集摘要、关键事件、节奏和 cliffhanger。`,
+  }, template);
 
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
     user: buildTaskDrivenUserPrompt({
-      taskInstruction: `请把故事拆分为恰好${totalEpisodes}集的分集计划，并明确每集摘要、关键事件、节奏和 cliffhanger。`,
+      taskInstruction: promptParts.taskInstruction,
       currentTaskSummary,
       outputFormat: JSON.stringify({
         episodes: [{
@@ -408,6 +449,7 @@ export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotS
         }],
         majorCliffhangers: [{ episodeNumber: 5, description: '关键悬念' }],
       }, null, 2),
+      extraRules: promptParts.extraRules,
     }),
   };
 }
@@ -415,7 +457,7 @@ export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotS
 // ============================================
 // Step 5: Scene Generation
 // ============================================
-export function sceneGenerationPrompt(input: TaskInput, storyOutline: any, characters: any, episode: any, previousEpisodes: any[]): PromptPackage {
+export function sceneGenerationPrompt(input: TaskInput, storyOutline: any, characters: any, episode: any, previousEpisodes: any[], template?: PromptTemplateOverride): PromptPackage {
   const prevSummary = previousEpisodes.length > 0
     ? previousEpisodes.slice(-2).map(e => `第${e.episode_number}集:${joinNonEmpty([e.title, e.summary], '｜')}`).join('；')
     : '第一集，无前情';
@@ -439,17 +481,21 @@ export function sceneGenerationPrompt(input: TaskInput, storyOutline: any, chara
     ], '\n'),
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位专业的场景编剧，擅长设计紧凑、有张力、有视觉冲击力的场景。',
       '每个场景必须有明确的进入点和退出点，包含至少一个戏剧冲突，动作描写具体可拍摄。',
       '',
       '输出要求：仅输出JSON。',
     ].join('\n'),
+    taskInstruction: `请为第${episode.episodeNumber}集生成4-6个可拍摄场景，突出进入点、退出点、冲突和叙事目的。`,
+  }, template);
 
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
     user: buildTaskDrivenUserPrompt({
-      taskInstruction: `请为第${episode.episodeNumber}集生成4-6个可拍摄场景，突出进入点、退出点、冲突和叙事目的。`,
+      taskInstruction: promptParts.taskInstruction,
       currentTaskSummary,
       outputFormat: JSON.stringify({
         scenes: [{
@@ -461,6 +507,7 @@ export function sceneGenerationPrompt(input: TaskInput, storyOutline: any, chara
           purpose: '叙事目的',
         }],
       }, null, 2),
+      extraRules: promptParts.extraRules,
     }),
   };
 }
@@ -468,7 +515,7 @@ export function sceneGenerationPrompt(input: TaskInput, storyOutline: any, chara
 // ============================================
 // Step 6: Dialogue Generation
 // ============================================
-export function dialogueGenerationPrompt(input: TaskInput, characters: any, episode: any, scenes: any[]): PromptPackage {
+export function dialogueGenerationPrompt(input: TaskInput, characters: any, episode: any, scenes: any[], template?: PromptTemplateOverride): PromptPackage {
   const charProfiles = [
     `【主角】${characters.protagonist.name}：${characters.protagonist.personality}。说话风格：${inferSpeechStyle(characters.protagonist.personality)}`,
     ...characters.characters.map((c: any) => `【${c.role}】${c.name}：${c.personality}。说话风格：${inferSpeechStyle(c.personality)}`),
@@ -490,8 +537,7 @@ export function dialogueGenerationPrompt(input: TaskInput, characters: any, epis
     ], '\n'),
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位顶级对白编剧，精通"潜台词"和"冰山理论"。',
       '对白必须：符合角色语言习惯、表面与真实意图有张力、节奏有变化、用对话推动剧情。',
@@ -499,13 +545,18 @@ export function dialogueGenerationPrompt(input: TaskInput, characters: any, epis
       '',
       '输出要求：仅输出JSON。',
     ].join('\n'),
-
-    user: buildTaskDrivenUserPrompt({
-      taskInstruction: [
+    taskInstruction: [
         `请为第${episode.episodeNumber}集的各场景生成对白。`,
         '每个场景4-6轮对话，每句不超过40字，包含动作/表情提示，并为下一场景或集尾悬念铺垫。',
         `场景列表参考：${sceneDescs}`,
       ].join('\n'),
+  }, template);
+
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
+    user: buildTaskDrivenUserPrompt({
+      taskInstruction: promptParts.taskInstruction,
       currentTaskSummary,
       outputFormat: JSON.stringify({
         dialogues: [{
@@ -515,6 +566,7 @@ export function dialogueGenerationPrompt(input: TaskInput, characters: any, epis
           ],
         }],
       }, null, 2),
+      extraRules: promptParts.extraRules,
     }),
   };
 }
@@ -522,7 +574,7 @@ export function dialogueGenerationPrompt(input: TaskInput, characters: any, epis
 // ============================================
 // Step 7: Script Composition
 // ============================================
-export function scriptCompositionPrompt(episode: any, scenes: any[], dialogues: any[]): PromptPackage {
+export function scriptCompositionPrompt(episode: any, scenes: any[], dialogues: any[], template?: PromptTemplateOverride): PromptPackage {
   const currentTaskSummary = buildCurrentTaskSummary({
     globalSummary: `本集定位:${joinNonEmpty([`第${episode.episodeNumber}集`, episode.title, episode.summary], '｜')}`,
     phaseSummary: joinNonEmpty([
@@ -532,13 +584,18 @@ export function scriptCompositionPrompt(episode: any, scenes: any[], dialogues: 
     mustInherit: '必须保留场景顺序、角色发言归属、动作信息，并使用标准 Markdown 剧本格式输出。',
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位专业的剧本排版师，熟悉国际标准剧本格式和Markdown排版规范。',
       '使用标准剧本格式（INT./EXT.、角色名居中大写、对白缩进），Markdown语法实现格式化。',
       '仅输出排版好的剧本内容，不输出任何解释。',
     ].join('\n'),
+    taskInstruction: '请基于当前任务摘要和必须继承信息，输出排版好的 Markdown 剧本。不得改动场景顺序、角色归属和核心动作。',
+  }, template);
+
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
 
     user: [
       '【任务】',
@@ -553,7 +610,7 @@ export function scriptCompositionPrompt(episode: any, scenes: any[], dialogues: 
       `完整对白数据：${JSON.stringify(dialogues, null, 2)}`,
       '',
       '[生成任务]',
-      '请基于当前任务摘要和必须继承信息，输出排版好的 Markdown 剧本。不得改动场景顺序、角色归属和核心动作。',
+      promptParts.taskInstruction,
       '',
       '[输出格式]',
       '```markdown',
@@ -586,7 +643,7 @@ export function scriptCompositionPrompt(episode: any, scenes: any[], dialogues: 
 // ============================================
 // Step 8: Evaluation
 // ============================================
-export function evaluationPrompt(input: TaskInput, storyOutline: any, episodeContent: string): PromptPackage {
+export function evaluationPrompt(input: TaskInput, storyOutline: any, episodeContent: string, template?: PromptTemplateOverride): PromptPackage {
   const currentTaskSummary = buildCurrentTaskSummary({
     globalSummary: joinNonEmpty([
       `标题:${storyOutline.title}`,
@@ -598,17 +655,22 @@ export function evaluationPrompt(input: TaskInput, storyOutline: any, episodeCon
     mustInherit: '评分必须严格基于样本内容与项目主题，不得臆造未出现情节。',
   });
 
-  return {
-    currentTaskSummary,
+  const promptParts = resolvePromptParts({
     system: [
       '你是一位资深剧本评审专家，曾担任多个影视奖项的评委。',
       '评分标准：1-3差 | 4-5及格 | 6-7良好 | 8-9优秀 | 10卓越',
       '',
       '输出要求：仅输出JSON，评分必须是1-10的整数。',
     ].join('\n'),
+    taskInstruction: '请基于当前任务摘要对样本剧本做结构化评分，给出分项评价、优点和建议。',
+  }, template);
+
+  return {
+    currentTaskSummary,
+    system: promptParts.system,
 
     user: buildTaskDrivenUserPrompt({
-      taskInstruction: '请基于当前任务摘要对样本剧本做结构化评分，给出分项评价、优点和建议。',
+      taskInstruction: promptParts.taskInstruction,
       currentTaskSummary,
       outputFormat: JSON.stringify({
         plot: { score: 8, comment: '剧情结构评价（50字）' },
@@ -620,6 +682,7 @@ export function evaluationPrompt(input: TaskInput, storyOutline: any, episodeCon
         strengths: ['优点1', '优点2'],
         suggestions: ['优化建议1', '优化建议2'],
       }, null, 2),
+      extraRules: promptParts.extraRules,
     }),
   };
 }

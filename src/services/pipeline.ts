@@ -14,8 +14,10 @@ import {
   scriptCompositionPrompt,
   evaluationPrompt,
   type PromptPackage,
+  type PromptTemplateOverride,
   type TaskInput,
 } from './prompts';
+import { getEffectivePromptTemplate } from './studio';
 
 export interface PipelineContext {
   taskId: string;
@@ -104,6 +106,7 @@ async function callAI(
   options: {
     jsonMode?: boolean;
     timeoutMs?: number;
+    maxTokensOverride?: number;
     stepNumber: number;
     stepName: string;
     episodeNumber?: number;
@@ -147,7 +150,7 @@ async function callAI(
 
     const startedAt = Date.now();
     const activeModel = provider.model || 'default';
-    const maxTokens = resolveMaxTokens(options.stepNumber, compressed, !jsonMode);
+    const maxTokens = options.maxTokensOverride || resolveMaxTokens(options.stepNumber, compressed, !jsonMode);
     const abortController = new AbortController();
 
     const onAbort = () => {
@@ -422,6 +425,17 @@ async function persistCurrentTaskSummary(
   });
 }
 
+async function getPromptOverride(context: PipelineContext, nodeKey: string): Promise<PromptTemplateOverride | undefined> {
+  const template = await getEffectivePromptTemplate(context.db, context.userId, nodeKey);
+  if (!template) return undefined;
+  return {
+    system_prompt: template.system_prompt,
+    task_instruction: template.task_instruction,
+    extra_rules: template.extra_rules,
+    model_config: template.model_config,
+  };
+}
+
 /**
  * 检查是否被中断
  */
@@ -440,9 +454,10 @@ function checkAbort(context: PipelineContext): void {
  */
 export async function executeStep1(context: PipelineContext): Promise<any> {
   await context.onLog?.({ level: 'info', stepNumber: 1, stepName: 'story_outline', message: '[Step 1] 生成故事大纲' });
-  const prompt = storyOutlinePrompt(context.input);
+  const override = await getPromptOverride(context, 'story_outline');
+  const prompt = storyOutlinePrompt(context.input, override);
   await persistCurrentTaskSummary(context, prompt, 1, 'story_outline');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 1, stepName: 'story_outline' });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 1, stepName: 'story_outline', maxTokensOverride: override?.model_config?.maxTokens });
   await context.onStepComplete?.(1, 'story_outline', result);
   return result;
 }
@@ -453,9 +468,10 @@ export async function executeStep1(context: PipelineContext): Promise<any> {
 export async function executeStep2(context: PipelineContext, storyOutline: any): Promise<any> {
   checkAbort(context);
   await context.onLog?.({ level: 'info', stepNumber: 2, stepName: 'characters', message: '[Step 2] 生成角色设定' });
-  const prompt = characterGenerationPrompt(context.input, storyOutline);
+  const override = await getPromptOverride(context, 'characters');
+  const prompt = characterGenerationPrompt(context.input, storyOutline, override);
   await persistCurrentTaskSummary(context, prompt, 2, 'characters');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 2, stepName: 'characters' });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 2, stepName: 'characters', maxTokensOverride: override?.model_config?.maxTokens });
   await context.onStepComplete?.(2, 'characters', result);
   return result;
 }
@@ -466,9 +482,10 @@ export async function executeStep2(context: PipelineContext, storyOutline: any):
 export async function executeStep3(context: PipelineContext, storyOutline: any, characters: any): Promise<any> {
   checkAbort(context);
   await context.onLog?.({ level: 'info', stepNumber: 3, stepName: 'plot_structure', message: '[Step 3] 生成剧情结构' });
-  const prompt = plotStructurePrompt(context.input, storyOutline, characters);
+  const override = await getPromptOverride(context, 'plot_structure');
+  const prompt = plotStructurePrompt(context.input, storyOutline, characters, override);
   await persistCurrentTaskSummary(context, prompt, 3, 'plot_structure');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 3, stepName: 'plot_structure' });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 3, stepName: 'plot_structure', maxTokensOverride: override?.model_config?.maxTokens });
   await context.onStepComplete?.(3, 'plot_structure', result);
   return result;
 }
@@ -483,9 +500,10 @@ export async function executeStep4(
 ): Promise<any> {
   checkAbort(context);
   await context.onLog?.({ level: 'info', stepNumber: 4, stepName: 'episode_plan', message: '[Step 4] 生成集数拆分计划' });
-  const prompt = episodePlanningPrompt(context.input, storyOutline, plotStructure, context.totalEpisodes);
+  const override = await getPromptOverride(context, 'episode_plan');
+  const prompt = episodePlanningPrompt(context.input, storyOutline, plotStructure, context.totalEpisodes, override);
   await persistCurrentTaskSummary(context, prompt, 4, 'episode_plan');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 4, stepName: 'episode_plan' });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 4, stepName: 'episode_plan', maxTokensOverride: override?.model_config?.maxTokens });
   await context.onStepComplete?.(4, 'episode_plan', result);
   return result;
 }
@@ -497,7 +515,8 @@ export async function executeStep5To7(
   context: PipelineContext,
   storyOutline: any,
   characters: any,
-  episodePlan: any
+  episodePlan: any,
+  loopStepOrder: number[] = [5, 6, 7],
 ): Promise<void> {
   const episodes = episodePlan.episodes;
   const completedEpisodes: any[] = [];
@@ -540,80 +559,72 @@ export async function executeStep5To7(
       message: `[Step 5-7] 开始生成第${episode.episodeNumber}集 / 共${episodes.length}集`,
     });
 
-    await context.db.prepare(
-      'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
-    ).bind(5, new Date().toISOString(), context.taskId).run();
-    await context.db.prepare(
-      `UPDATE pipeline_steps
-       SET status = CASE WHEN step_number = 5 THEN 'running' ELSE 'pending' END,
-           started_at = CASE WHEN step_number = 5 THEN ? ELSE started_at END,
-           completed_at = CASE WHEN step_number IN (6,7) THEN NULL ELSE completed_at END
-       WHERE task_id = ? AND step_number IN (5,6,7)`
-    ).bind(new Date().toISOString(), context.taskId).run();
+    let scenes: any = { scenes: [] };
+    let dialogues: any = { dialogues: [] };
+    let content = '';
 
-    const scenePrompt = sceneGenerationPrompt(
-      context.input, storyOutline, characters, episode,
-      completedEpisodes.slice(-3)
-    );
-    await persistCurrentTaskSummary(context, scenePrompt, 5, 'scenes', episode.episodeNumber);
-    const scenes = await callAI(context.provider, scenePrompt.system, scenePrompt.user, context, {
-      stepNumber: 5,
-      stepName: 'scenes',
-      episodeNumber: episode.episodeNumber,
-    });
+    for (const stepNumber of loopStepOrder) {
+      checkAbort(context);
 
-    checkAbort(context);
+      await context.db.prepare(
+        'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
+      ).bind(stepNumber, new Date().toISOString(), context.taskId).run();
+      await context.db.prepare(
+        `UPDATE pipeline_steps
+         SET status = CASE WHEN step_number = ? THEN 'running' ELSE status END,
+             started_at = CASE WHEN step_number = ? THEN ? ELSE started_at END
+         WHERE task_id = ? AND step_number IN (5,6,7)`
+      ).bind(stepNumber, stepNumber, new Date().toISOString(), context.taskId).run();
 
-    await context.db.prepare(
-      'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
-    ).bind(6, new Date().toISOString(), context.taskId).run();
-    await context.db.prepare(
-      `UPDATE pipeline_steps
-       SET status = CASE WHEN step_number = 6 THEN 'running' ELSE 'pending' END,
-           started_at = CASE WHEN step_number = 6 THEN ? ELSE started_at END,
-           completed_at = CASE WHEN step_number IN (5,7) THEN NULL ELSE completed_at END
-       WHERE task_id = ? AND step_number IN (5,6,7)`
-    ).bind(new Date().toISOString(), context.taskId).run();
-
-    const dialoguePrompt = dialogueGenerationPrompt(
-      context.input, characters, episode, scenes.scenes || []
-    );
-    await persistCurrentTaskSummary(context, dialoguePrompt, 6, 'dialogue', episode.episodeNumber);
-    const dialogues = await callAI(context.provider, dialoguePrompt.system, dialoguePrompt.user, context, {
-      stepNumber: 6,
-      stepName: 'dialogue',
-      episodeNumber: episode.episodeNumber,
-    });
-
-    checkAbort(context);
-
-    await context.db.prepare(
-      'UPDATE generation_tasks SET current_step = ?, updated_at = ? WHERE id = ?'
-    ).bind(7, new Date().toISOString(), context.taskId).run();
-    await context.db.prepare(
-      `UPDATE pipeline_steps
-       SET status = CASE WHEN step_number = 7 THEN 'running' ELSE 'pending' END,
-           started_at = CASE WHEN step_number = 7 THEN ? ELSE started_at END,
-           completed_at = CASE WHEN step_number IN (5,6) THEN NULL ELSE completed_at END
-       WHERE task_id = ? AND step_number IN (5,6,7)`
-    ).bind(new Date().toISOString(), context.taskId).run();
-
-    const composePrompt = scriptCompositionPrompt(
-      episode, scenes.scenes || [], dialogues.dialogues || []
-    );
-    await persistCurrentTaskSummary(context, composePrompt, 7, 'compose', episode.episodeNumber);
-    const content = await callAI(
-      context.provider,
-      composePrompt.system,
-      composePrompt.user,
-      context,
-      {
-        jsonMode: false,
-        stepNumber: 7,
-        stepName: 'compose',
-        episodeNumber: episode.episodeNumber,
+      if (stepNumber === 5) {
+        const sceneOverride = await getPromptOverride(context, 'scenes');
+        const scenePrompt = sceneGenerationPrompt(
+          context.input, storyOutline, characters, episode, completedEpisodes.slice(-3), sceneOverride
+        );
+        await persistCurrentTaskSummary(context, scenePrompt, 5, 'scenes', episode.episodeNumber);
+        scenes = await callAI(context.provider, scenePrompt.system, scenePrompt.user, context, {
+          stepNumber: 5,
+          stepName: 'scenes',
+          episodeNumber: episode.episodeNumber,
+          maxTokensOverride: sceneOverride?.model_config?.maxTokens,
+        });
       }
-    );
+
+      if (stepNumber === 6) {
+        const dialogueOverride = await getPromptOverride(context, 'dialogue');
+        const dialoguePrompt = dialogueGenerationPrompt(
+          context.input, characters, episode, scenes.scenes || [], dialogueOverride
+        );
+        await persistCurrentTaskSummary(context, dialoguePrompt, 6, 'dialogue', episode.episodeNumber);
+        dialogues = await callAI(context.provider, dialoguePrompt.system, dialoguePrompt.user, context, {
+          stepNumber: 6,
+          stepName: 'dialogue',
+          episodeNumber: episode.episodeNumber,
+          maxTokensOverride: dialogueOverride?.model_config?.maxTokens,
+        });
+      }
+
+      if (stepNumber === 7) {
+        const composeOverride = await getPromptOverride(context, 'compose');
+        const composePrompt = scriptCompositionPrompt(
+          episode, scenes.scenes || [], dialogues.dialogues || [], composeOverride
+        );
+        await persistCurrentTaskSummary(context, composePrompt, 7, 'compose', episode.episodeNumber);
+        content = await callAI(
+          context.provider,
+          composePrompt.system,
+          composePrompt.user,
+          context,
+          {
+            jsonMode: false,
+            stepNumber: 7,
+            stepName: 'compose',
+            episodeNumber: episode.episodeNumber,
+            maxTokensOverride: composeOverride?.model_config?.maxTokens,
+          }
+        );
+      }
+    }
 
     // 保存到DB
     await context.db.prepare(`
@@ -677,9 +688,10 @@ export async function executeStep8(context: PipelineContext, storyOutline: any):
     return null;
   }
 
-  const prompt = evaluationPrompt(context.input, storyOutline, sampleEpisode.content as string);
+  const override = await getPromptOverride(context, 'evaluate');
+  const prompt = evaluationPrompt(context.input, storyOutline, sampleEpisode.content as string, override);
   await persistCurrentTaskSummary(context, prompt, 8, 'evaluate');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 8, stepName: 'evaluate' });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 8, stepName: 'evaluate', maxTokensOverride: override?.model_config?.maxTokens });
   await context.onStepComplete?.(8, 'evaluate', result);
   return result;
 }
@@ -716,9 +728,10 @@ export async function executePipelinePhase2(
   context: PipelineContext,
   storyOutline: any,
   characters: any,
-  episodePlan: any
+  episodePlan: any,
+  loopStepOrder: number[] = [5, 6, 7],
 ): Promise<void> {
-  await executeStep5To7(context, storyOutline, characters, episodePlan);
+  await executeStep5To7(context, storyOutline, characters, episodePlan, loopStepOrder);
 }
 
 /**
