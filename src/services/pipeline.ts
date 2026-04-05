@@ -3,7 +3,7 @@
  * 管理8步剧本生成流水线，支持中断/续传
  */
 
-import type { AIProvider } from './ai-provider';
+import type { AIProvider, AIRequestLog } from './ai-provider';
 import {
   storyOutlinePrompt,
   characterGenerationPrompt,
@@ -224,6 +224,58 @@ async function callAI(
           streamedOutput += chunk;
           streamedSinceLastEmit += chunk;
           await emitStreamChunk();
+        },
+        onRequestLog: async (log: AIRequestLog) => {
+          if (log.type === 'request') {
+            await context.onLiveLog?.({
+              level: 'info',
+              stepNumber: options.stepNumber,
+              stepName: options.stepName,
+              episodeNumber: options.episodeNumber,
+              message: `[HTTP Request] ${log.method} ${log.url}`,
+              detail: [
+                `[URL] ${log.url}`,
+                log.headers ? `[Headers]\n${JSON.stringify(log.headers, null, 2)}` : '',
+                `[Body]\n${log.body}`,
+              ].filter(Boolean).join('\n\n'),
+            });
+          } else if (log.type === 'response') {
+            await context.onLiveLog?.({
+              level: 'success',
+              stepNumber: options.stepNumber,
+              stepName: options.stepName,
+              episodeNumber: options.episodeNumber,
+              message: `[HTTP Response] status=${log.statusCode || 'OK'}`,
+              detail: `[Raw Response]\n${log.rawResponse}`,
+            });
+          } else if (log.type === 'stream_chunk') {
+            await context.onLiveLog?.({
+              level: 'info',
+              stepNumber: options.stepNumber,
+              stepName: options.stepName,
+              episodeNumber: options.episodeNumber,
+              message: `[Stream Chunk] ${provider.name}/${activeModel}`,
+              detail: log.rawResponse,
+            });
+          } else if (log.type === 'stream_done') {
+            await context.onLiveLog?.({
+              level: 'success',
+              stepNumber: options.stepNumber,
+              stepName: options.stepName,
+              episodeNumber: options.episodeNumber,
+              message: `[Stream Done] ${provider.name}/${activeModel}`,
+              detail: log.rawResponse,
+            });
+          } else if (log.type === 'error') {
+            await context.onLiveLog?.({
+              level: 'error',
+              stepNumber: options.stepNumber,
+              stepName: options.stepName,
+              episodeNumber: options.episodeNumber,
+              message: `[HTTP Error] status=${log.statusCode}`,
+              detail: `[Error] ${log.error}\n\n[Raw Response]\n${log.rawResponse}`,
+            });
+          }
         },
       });
 

@@ -5,6 +5,17 @@ export interface AIMessage {
   content: string;
 }
 
+export interface AIRequestLog {
+  type: 'request' | 'response' | 'stream_chunk' | 'stream_done' | 'error';
+  url?: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  rawResponse?: string;
+  statusCode?: number;
+  error?: string;
+}
+
 export interface AIRequestOptions {
   model?: string;
   maxTokens?: number;
@@ -12,6 +23,7 @@ export interface AIRequestOptions {
   jsonMode?: boolean;
   signal?: AbortSignal;
   onChunk?: (chunk: string) => void | Promise<void>;
+  onRequestLog?: (log: AIRequestLog) => void | Promise<void>;
 }
 
 export interface AIResponse {
@@ -61,10 +73,24 @@ export class CloudflareAIProvider implements AIProvider {
       content: m.content,
     }));
 
-    const response = await this.ai.run(model, {
+    const runParams = {
       messages: cfMessages,
       max_tokens: options?.maxTokens || 4096,
       temperature: options?.temperature ?? 0.7,
+    };
+
+    await options?.onRequestLog?.({
+      type: 'request',
+      url: `cloudflare-ai://workers-ai/${model}`,
+      method: 'ai.run',
+      body: JSON.stringify(runParams, null, 2),
+    });
+
+    const response = await this.ai.run(model, runParams);
+
+    await options?.onRequestLog?.({
+      type: 'response',
+      rawResponse: JSON.stringify(response, null, 2),
     });
 
     return {
@@ -106,26 +132,53 @@ export class OpenAICompatibleProvider implements AIProvider {
       body.stream_options = { include_usage: true };
     }
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+    const requestUrl = `${this.baseUrl}/chat/completions`;
+    const requestHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this.apiKey.slice(0, 8)}...${this.apiKey.slice(-4)}`,
+    };
+    const requestBody = JSON.stringify(body);
+
+    await options?.onRequestLog?.({
+      type: 'request',
+      url: requestUrl,
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify(body, null, 2),
+    });
+
+    const response = await fetch(requestUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.apiKey}`,
       },
       signal: options?.signal,
-      body: JSON.stringify(body),
+      body: requestBody,
     });
 
     if (!response.ok) {
       const err = await response.text();
+      await options?.onRequestLog?.({
+        type: 'error',
+        statusCode: response.status,
+        rawResponse: err,
+        error: `${this.name} API error: ${response.status} - ${err}`,
+      });
       throw new Error(`${this.name} API error: ${response.status} - ${err}`);
     }
 
     if (options?.onChunk && response.body) {
-      return this.readStreamingResponse(response, options.onChunk);
+      return this.readStreamingResponse(response, options.onChunk, options.onRequestLog);
     }
 
     const data: any = await response.json();
+
+    await options?.onRequestLog?.({
+      type: 'response',
+      statusCode: response.status,
+      rawResponse: JSON.stringify(data, null, 2),
+    });
 
     return {
       content: data.choices[0].message.content,
@@ -137,7 +190,7 @@ export class OpenAICompatibleProvider implements AIProvider {
     };
   }
 
-  private async readStreamingResponse(response: Response, onChunk: (chunk: string) => void | Promise<void>): Promise<AIResponse> {
+  private async readStreamingResponse(response: Response, onChunk: (chunk: string) => void | Promise<void>, onRequestLog?: (log: AIRequestLog) => void | Promise<void>): Promise<AIResponse> {
     const reader = response.body?.getReader();
     if (!reader) {
       throw new Error(`${this.name} API error: response body is not readable`);
@@ -154,6 +207,11 @@ export class OpenAICompatibleProvider implements AIProvider {
 
       const payload = trimmed.slice(5).trim();
       if (!payload || payload === '[DONE]') return;
+
+      await onRequestLog?.({
+        type: 'stream_chunk',
+        rawResponse: payload,
+      });
 
       const data = JSON.parse(payload);
       const delta = data.choices?.[0]?.delta?.content;
@@ -190,6 +248,12 @@ export class OpenAICompatibleProvider implements AIProvider {
         await processLine(line);
       }
     }
+
+    await onRequestLog?.({
+      type: 'stream_done',
+      statusCode: response.status,
+      rawResponse: `[Stream completed] Total content length: ${content.length} chars`,
+    });
 
     return { content, usage };
   }
@@ -228,7 +292,23 @@ export class ClaudeProvider implements AIProvider {
       body.system = systemMsg.content;
     }
 
-    const response = await fetch(`${this.baseUrl}/messages`, {
+    const requestUrl = `${this.baseUrl}/messages`;
+    const requestHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'x-api-key': `${this.apiKey.slice(0, 8)}...${this.apiKey.slice(-4)}`,
+      'anthropic-version': '2023-06-01',
+    };
+    const requestBody = JSON.stringify(body);
+
+    await options?.onRequestLog?.({
+      type: 'request',
+      url: requestUrl,
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify(body, null, 2),
+    });
+
+    const response = await fetch(requestUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -236,15 +316,27 @@ export class ClaudeProvider implements AIProvider {
         'anthropic-version': '2023-06-01',
       },
       signal: options?.signal,
-      body: JSON.stringify(body),
+      body: requestBody,
     });
 
     if (!response.ok) {
       const err = await response.text();
+      await options?.onRequestLog?.({
+        type: 'error',
+        statusCode: response.status,
+        rawResponse: err,
+        error: `Claude API error: ${response.status} - ${err}`,
+      });
       throw new Error(`Claude API error: ${response.status} - ${err}`);
     }
 
     const data: any = await response.json();
+
+    await options?.onRequestLog?.({
+      type: 'response',
+      statusCode: response.status,
+      rawResponse: JSON.stringify(data, null, 2),
+    });
 
     return {
       content: data.content[0].text,

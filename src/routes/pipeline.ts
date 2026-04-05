@@ -220,7 +220,12 @@ async function broadcastTransientLog(taskId: string, entry: PipelineLogEntry): P
 }
 
 function shouldPersistLiveLog(entry: PipelineLogEntry): boolean {
-  return entry.message.startsWith('[AI Input]') || entry.message.startsWith('[AI Output]');
+  return entry.message.startsWith('[AI Input]')
+    || entry.message.startsWith('[AI Output]')
+    || entry.message.startsWith('[HTTP Request]')
+    || entry.message.startsWith('[HTTP Response]')
+    || entry.message.startsWith('[HTTP Error]')
+    || entry.message.startsWith('[Stream Done]');
 }
 
 function buildProgressPayload(taskId: string, task: any) {
