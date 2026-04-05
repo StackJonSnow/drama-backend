@@ -13,6 +13,7 @@ export interface AIServiceDefinition {
   apiKeyFormat?: string;
   defaultBaseUrl?: string;
   defaultModel?: string;
+  recentModels?: Array<{ value: string; label: string }>;
   tags?: string[];
 }
 
@@ -28,6 +29,14 @@ const AI_SERVICES: AIServiceDefinition[] = [
     supportsModelListing: false,
     isDefault: true,
     defaultModel: '@cf/meta/llama-3.1-8b-instruct',
+    recentModels: [
+      { value: '@cf/meta/llama-3.1-8b-instruct', label: 'Llama 3.1 8B Instruct' },
+      { value: '@cf/meta/llama-3.1-70b-instruct', label: 'Llama 3.1 70B Instruct' },
+      { value: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', label: 'Llama 3.3 70B Fast' },
+      { value: '@cf/meta/llama-4-scout-17b-16e-instruct', label: 'Llama 4 Scout 17B' },
+      { value: '@cf/google/gemma-4-26b-a4b-it', label: 'Gemma 4 26B' },
+      { value: '@cf/mistralai/mistral-small-3.1-24b-instruct', label: 'Mistral Small 3.1 24B' },
+    ],
     tags: ['默认', '内置'],
   },
   {
@@ -38,10 +47,14 @@ const AI_SERVICES: AIServiceDefinition[] = [
     requiresApiKey: true,
     requiresBaseUrl: true,
     requiresModel: true,
-    supportsModelListing: false,
+    supportsModelListing: true,
     apiKeyFormat: 'sk-...',
     defaultBaseUrl: 'https://api.deepseek.com/v1',
     defaultModel: 'deepseek-chat',
+    recentModels: [
+      { value: 'deepseek-chat', label: 'DeepSeek Chat (V3)' },
+      { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner (R1)' },
+    ],
     tags: ['国产', 'OpenAI 兼容'],
   },
   {
@@ -52,10 +65,17 @@ const AI_SERVICES: AIServiceDefinition[] = [
     requiresApiKey: true,
     requiresBaseUrl: true,
     requiresModel: true,
-    supportsModelListing: false,
+    supportsModelListing: true,
     apiKeyFormat: 'sk-...',
     defaultBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     defaultModel: 'qwen-plus',
+    recentModels: [
+      { value: 'qwen-plus', label: 'Qwen Plus' },
+      { value: 'qwen-max', label: 'Qwen Max' },
+      { value: 'qwen-turbo', label: 'Qwen Turbo' },
+      { value: 'qwen3-32b', label: 'Qwen3 32B' },
+      { value: 'qwen3-235b-a22b', label: 'Qwen3 235B A22B' },
+    ],
     tags: ['国产', 'OpenAI 兼容'],
   },
   {
@@ -66,10 +86,16 @@ const AI_SERVICES: AIServiceDefinition[] = [
     requiresApiKey: true,
     requiresBaseUrl: true,
     requiresModel: true,
-    supportsModelListing: false,
+    supportsModelListing: true,
     apiKeyFormat: '填写平台密钥',
     defaultBaseUrl: 'https://api.z.ai/api/paas/v4',
     defaultModel: 'glm-4-flash',
+    recentModels: [
+      { value: 'glm-4-flash', label: 'GLM-4 Flash' },
+      { value: 'glm-4-air', label: 'GLM-4 Air' },
+      { value: 'glm-4-plus', label: 'GLM-4 Plus' },
+      { value: 'glm-4.5', label: 'GLM-4.5' },
+    ],
     tags: ['国产', 'OpenAI 兼容'],
   },
   {
@@ -80,10 +106,16 @@ const AI_SERVICES: AIServiceDefinition[] = [
     requiresApiKey: true,
     requiresBaseUrl: true,
     requiresModel: true,
-    supportsModelListing: false,
+    supportsModelListing: true,
     apiKeyFormat: 'sk-...',
     defaultBaseUrl: 'https://api.moonshot.ai/v1',
     defaultModel: 'moonshot-v1-8k',
+    recentModels: [
+      { value: 'moonshot-v1-8k', label: 'Moonshot v1 8K' },
+      { value: 'moonshot-v1-32k', label: 'Moonshot v1 32K' },
+      { value: 'moonshot-v1-128k', label: 'Moonshot v1 128K' },
+      { value: 'kimi-k2-0711-preview', label: 'Kimi K2 Preview' },
+    ],
     tags: ['国产', 'OpenAI 兼容'],
   },
   {
@@ -94,10 +126,15 @@ const AI_SERVICES: AIServiceDefinition[] = [
     requiresApiKey: true,
     requiresBaseUrl: true,
     requiresModel: true,
-    supportsModelListing: false,
+    supportsModelListing: true,
     apiKeyFormat: '填写平台密钥',
     defaultBaseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
     defaultModel: 'doubao-seed-1-6-flash-250615',
+    recentModels: [
+      { value: 'doubao-seed-1-6-flash-250615', label: 'Doubao Seed 1.6 Flash' },
+      { value: 'doubao-seed-1-6-pro-250615', label: 'Doubao Seed 1.6 Pro' },
+      { value: 'doubao-seed-1-6-thinking-250715', label: 'Doubao Seed 1.6 Thinking' },
+    ],
     tags: ['国产', 'OpenAI 兼容'],
   },
   {
@@ -108,10 +145,16 @@ const AI_SERVICES: AIServiceDefinition[] = [
     requiresApiKey: true,
     requiresBaseUrl: true,
     requiresModel: true,
-    supportsModelListing: false,
+    supportsModelListing: true,
     apiKeyFormat: 'sk-...',
     defaultBaseUrl: 'https://api.siliconflow.com/v1',
     defaultModel: 'deepseek-ai/DeepSeek-V3',
+    recentModels: [
+      { value: 'deepseek-ai/DeepSeek-V3', label: 'DeepSeek V3' },
+      { value: 'deepseek-ai/DeepSeek-R1', label: 'DeepSeek R1' },
+      { value: 'Qwen/Qwen3-32B', label: 'Qwen3 32B' },
+      { value: 'Qwen/Qwen3-235B-A22B', label: 'Qwen3 235B A22B' },
+    ],
     tags: ['国产', '聚合', 'OpenAI 兼容'],
   },
   {
@@ -126,6 +169,13 @@ const AI_SERVICES: AIServiceDefinition[] = [
     apiKeyFormat: 'sk-...',
     defaultBaseUrl: 'https://api.openai.com/v1',
     defaultModel: 'gpt-4o-mini',
+    recentModels: [
+      { value: 'gpt-4o', label: 'GPT-4o' },
+      { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
+      { value: 'o1', label: 'o1' },
+      { value: 'o1-mini', label: 'o1 Mini' },
+      { value: 'o3-mini', label: 'o3 Mini' },
+    ],
     tags: ['国际', 'OpenAI 兼容'],
   },
   {
@@ -140,6 +190,12 @@ const AI_SERVICES: AIServiceDefinition[] = [
     apiKeyFormat: 'sk-ant-...',
     defaultBaseUrl: 'https://api.anthropic.com/v1',
     defaultModel: 'claude-sonnet-4-20250514',
+    recentModels: [
+      { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
+      { value: 'claude-opus-4-20250514', label: 'Claude Opus 4' },
+      { value: 'claude-3-5-sonnet-20240620', label: 'Claude 3.5 Sonnet' },
+      { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku' },
+    ],
     tags: ['国际', '官方'],
   },
 ];
