@@ -101,10 +101,6 @@ export class OpenAICompatibleProvider implements AIProvider {
       temperature: options?.temperature ?? 0.7,
     };
 
-    if (options?.jsonMode && this.name !== 'deepseek') {
-      body.response_format = { type: 'json_object' };
-    }
-
     if (options?.onChunk) {
       body.stream = true;
       body.stream_options = { include_usage: true };

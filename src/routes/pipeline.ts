@@ -355,6 +355,25 @@ function buildLineDiff(baseContent: string, targetContent: string) {
   return diff;
 }
 
+function normalizeStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const normalized = value
+    .map((item) => {
+      if (typeof item === 'string') return item.trim();
+      if (item && typeof item === 'object') {
+        const objectValue = item as Record<string, unknown>;
+        return [objectValue.name, objectValue.role, objectValue.identity, objectValue.goal, objectValue.conflict]
+          .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+          .join('｜')
+          .trim();
+      }
+      return String(item || '').trim();
+    })
+    .filter(Boolean);
+
+  return normalized.length ? normalized : undefined;
+}
+
 /**
  * POST /api/pipeline/start
  * 创建新的生成任务并开始流水线
@@ -380,6 +399,8 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       ai_service || 'cloudflare-ai',
     );
     const workflowTemplate = await resolveWorkflowTemplateForTask(c.env.DB, Number(payload.userId), workflow_template_id ? Number(workflow_template_id) : undefined);
+    const normalizedKeyPoints = normalizeStringArray(key_points);
+    const normalizedCharactersInput = normalizeStringArray(characters_input);
 
     const taskId = generateTaskId();
     const now = new Date().toISOString();
@@ -401,8 +422,8 @@ pipelineRoutes.post('/start', jwtAuth, async (c) => {
       target_platform || null,
       target_duration || null,
       character_count || null,
-      key_points ? JSON.stringify(key_points) : null,
-      characters_input ? JSON.stringify(characters_input) : null,
+      normalizedKeyPoints ? JSON.stringify(normalizedKeyPoints) : null,
+      normalizedCharactersInput ? JSON.stringify(normalizedCharactersInput) : null,
       scene_input || null,
       aiSelection.serviceName,
       aiSelection.model,
