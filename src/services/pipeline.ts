@@ -107,6 +107,7 @@ async function callAI(
     jsonMode?: boolean;
     timeoutMs?: number;
     maxTokensOverride?: number;
+    temperatureOverride?: number;
     stepNumber: number;
     stepName: string;
     episodeNumber?: number;
@@ -216,7 +217,7 @@ async function callAI(
 
       const aiPromise = provider.chat(messages, {
         maxTokens,
-        temperature: 0.7,
+        temperature: options.temperatureOverride ?? 0.7,
         jsonMode,
         signal: abortController.signal,
         onChunk: async (chunk) => {
@@ -457,7 +458,7 @@ export async function executeStep1(context: PipelineContext): Promise<any> {
   const override = await getPromptOverride(context, 'story_outline');
   const prompt = storyOutlinePrompt(context.input, override);
   await persistCurrentTaskSummary(context, prompt, 1, 'story_outline');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 1, stepName: 'story_outline', maxTokensOverride: override?.model_config?.maxTokens });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 1, stepName: 'story_outline', maxTokensOverride: override?.model_config?.maxTokens, temperatureOverride: override?.model_config?.temperature });
   await context.onStepComplete?.(1, 'story_outline', result);
   return result;
 }
@@ -471,7 +472,7 @@ export async function executeStep2(context: PipelineContext, storyOutline: any):
   const override = await getPromptOverride(context, 'characters');
   const prompt = characterGenerationPrompt(context.input, storyOutline, override);
   await persistCurrentTaskSummary(context, prompt, 2, 'characters');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 2, stepName: 'characters', maxTokensOverride: override?.model_config?.maxTokens });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 2, stepName: 'characters', maxTokensOverride: override?.model_config?.maxTokens, temperatureOverride: override?.model_config?.temperature });
   await context.onStepComplete?.(2, 'characters', result);
   return result;
 }
@@ -485,7 +486,7 @@ export async function executeStep3(context: PipelineContext, storyOutline: any, 
   const override = await getPromptOverride(context, 'plot_structure');
   const prompt = plotStructurePrompt(context.input, storyOutline, characters, override);
   await persistCurrentTaskSummary(context, prompt, 3, 'plot_structure');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 3, stepName: 'plot_structure', maxTokensOverride: override?.model_config?.maxTokens });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 3, stepName: 'plot_structure', maxTokensOverride: override?.model_config?.maxTokens, temperatureOverride: override?.model_config?.temperature });
   await context.onStepComplete?.(3, 'plot_structure', result);
   return result;
 }
@@ -503,7 +504,7 @@ export async function executeStep4(
   const override = await getPromptOverride(context, 'episode_plan');
   const prompt = episodePlanningPrompt(context.input, storyOutline, plotStructure, context.totalEpisodes, override);
   await persistCurrentTaskSummary(context, prompt, 4, 'episode_plan');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 4, stepName: 'episode_plan', maxTokensOverride: override?.model_config?.maxTokens });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 4, stepName: 'episode_plan', maxTokensOverride: override?.model_config?.maxTokens, temperatureOverride: override?.model_config?.temperature });
   await context.onStepComplete?.(4, 'episode_plan', result);
   return result;
 }
@@ -587,6 +588,7 @@ export async function executeStep5To7(
           stepName: 'scenes',
           episodeNumber: episode.episodeNumber,
           maxTokensOverride: sceneOverride?.model_config?.maxTokens,
+          temperatureOverride: sceneOverride?.model_config?.temperature,
         });
       }
 
@@ -601,6 +603,7 @@ export async function executeStep5To7(
           stepName: 'dialogue',
           episodeNumber: episode.episodeNumber,
           maxTokensOverride: dialogueOverride?.model_config?.maxTokens,
+          temperatureOverride: dialogueOverride?.model_config?.temperature,
         });
       }
 
@@ -621,6 +624,7 @@ export async function executeStep5To7(
             stepName: 'compose',
             episodeNumber: episode.episodeNumber,
             maxTokensOverride: composeOverride?.model_config?.maxTokens,
+            temperatureOverride: composeOverride?.model_config?.temperature,
           }
         );
       }
@@ -691,7 +695,7 @@ export async function executeStep8(context: PipelineContext, storyOutline: any):
   const override = await getPromptOverride(context, 'evaluate');
   const prompt = evaluationPrompt(context.input, storyOutline, sampleEpisode.content as string, override);
   await persistCurrentTaskSummary(context, prompt, 8, 'evaluate');
-  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 8, stepName: 'evaluate', maxTokensOverride: override?.model_config?.maxTokens });
+  const result = await callAI(context.provider, prompt.system, prompt.user, context, { stepNumber: 8, stepName: 'evaluate', maxTokensOverride: override?.model_config?.maxTokens, temperatureOverride: override?.model_config?.temperature });
   await context.onStepComplete?.(8, 'evaluate', result);
   return result;
 }
