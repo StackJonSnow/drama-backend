@@ -306,7 +306,7 @@ export function characterGenerationPrompt(input: TaskInput, storyOutline: any, t
       '输出要求：仅输出JSON，不输出任何解释性文字。',
     ].join('\n'),
     taskInstruction: '请基于当前任务摘要，设计恰好指定数量的主要角色，重点保持人物目标、关系张力、功能分工和反派动机自洽。',
-    extraRules: ['优先保留人物状态、目标、冲突与关键设定，不要复述无关世界观细节'],
+    extraRules: ['优先保留人物状态、目标、冲突与关键设定，不要复述无关世界观细节', '所有字段必须简洁凝练，单字段优先控制在30-70字内'],
   }, template);
 
   return {
@@ -318,15 +318,15 @@ export function characterGenerationPrompt(input: TaskInput, storyOutline: any, t
       outputFormat: JSON.stringify({
         protagonist: {
           name: '姓名', age: '年龄', gender: '性别',
-          appearance: '外貌特征（50字）',
-          personality: '性格标签+具体表现（100字）',
-          background: '成长经历（100字）',
+          appearance: '外貌特征（30-50字）',
+          personality: '性格标签+具体表现（40-70字）',
+          background: '成长经历（40-70字）',
           goal: '核心目标', flaw: '致命弱点',
           arc: '角色弧线变化（从A状态到B状态）',
         },
         characters: [{
           name: '姓名', role: '角色功能（盟友/对手/导师/催化剂等）',
-          age: '年龄', personality: '性格', background: '背景',
+          age: '年龄', personality: '性格（30字内）', background: '背景（50字内）',
           goal: '目标', relationship: '与主角的关系',
           dramaticFunction: '在剧情中的功能',
         }],
@@ -376,6 +376,7 @@ export function plotStructurePrompt(input: TaskInput, storyOutline: any, charact
       '输出要求：仅输出JSON，不要输出超过20个场景。',
     ].join('\n'),
     taskInstruction: `请生成高层级剧情结构：第一幕约${act1Scenes}场、第二幕约${act2Scenes}场、第三幕约${act3Scenes}场，确保场景之间有清晰因果链和转折。`,
+    extraRules: ['场景描述和叙事目的保持精炼，单场景描述优先控制在50字内'],
   }, template);
 
   return {
@@ -429,6 +430,7 @@ export function episodePlanningPrompt(input: TaskInput, storyOutline: any, plotS
       `输出要求：仅输出JSON，episodes数组必须恰好包含 ${totalEpisodes} 项。`,
     ].join('\n'),
     taskInstruction: `请把故事拆分为恰好${totalEpisodes}集的分集计划，并明确每集摘要、关键事件、节奏和 cliffhanger。`,
+    extraRules: ['每集摘要保持紧凑，避免大段铺陈；优先写推进与钩子'],
   }, template);
 
   return {
@@ -489,6 +491,7 @@ export function sceneGenerationPrompt(input: TaskInput, storyOutline: any, chara
       '输出要求：仅输出JSON。',
     ].join('\n'),
     taskInstruction: `请为第${episode.episodeNumber}集生成4-6个可拍摄场景，突出进入点、退出点、冲突和叙事目的。`,
+    extraRules: ['每个场景描述、冲突和目的都尽量短句化，避免冗长散文'],
   }, template);
 
   return {
@@ -550,6 +553,7 @@ export function dialogueGenerationPrompt(input: TaskInput, characters: any, epis
         '每个场景4-6轮对话，每句不超过40字，包含动作/表情提示，并为下一场景或集尾悬念铺垫。',
         `场景列表参考：${sceneDescs}`,
       ].join('\n'),
+    extraRules: ['对白要短促、可演，减少解释性长句'],
   }, template);
 
   return {

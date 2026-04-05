@@ -124,19 +124,19 @@ async function callAI(
       case 1:
         return 2200;
       case 2:
-        return 3200;
+        return 2200;
       case 3:
-        return 2600;
+        return 2200;
       case 4:
-        return 3400;
+        return 2600;
       case 5:
-        return 2600;
+        return 1800;
       case 6:
-        return 2600;
+        return 1800;
       case 7:
-        return 5200;
+        return 3200;
       case 8:
-        return 1600;
+        return 1200;
       default:
         return plainText ? 4500 : 2600;
     }
