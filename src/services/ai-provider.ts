@@ -201,23 +201,26 @@ export class OpenAICompatibleProvider implements AIProvider {
     let content = '';
     let usage: AIResponse['usage'];
 
-    const processLine = async (line: string) => {
+    const processLine = (line: string) => {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) return;
 
       const payload = trimmed.slice(5).trim();
       if (!payload || payload === '[DONE]') return;
 
-      await onRequestLog?.({
+      // Fire-and-forget: stream chunk logs are observational, no need to block the read loop
+      void onRequestLog?.({
         type: 'stream_chunk',
         rawResponse: payload,
-      });
+      })?.catch(() => {});
 
       const data = JSON.parse(payload);
       const delta = data.choices?.[0]?.delta?.content;
       if (typeof delta === 'string' && delta.length > 0) {
         content += delta;
-        await onChunk(delta);
+        // Fire-and-forget: onChunk accumulates state synchronously in the caller,
+        // the async part (emitStreamChunk) is purely for live log broadcasting
+        void onChunk(delta)?.catch(() => {});
       }
 
       if (data.usage) {
@@ -238,14 +241,14 @@ export class OpenAICompatibleProvider implements AIProvider {
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        await processLine(line);
+        processLine(line);
       }
     }
 
     buffer += decoder.decode();
     if (buffer.trim()) {
       for (const line of buffer.split('\n')) {
-        await processLine(line);
+        processLine(line);
       }
     }
 

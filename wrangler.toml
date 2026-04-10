@@ -3,6 +3,12 @@ main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
 
+# NOTE: [limits] requires Cloudflare Workers paid plan ($5/month).
+# On free plan, cpu_ms is capped at 10ms and this config is silently ignored.
+# Uncomment below after upgrading to paid plan:
+# [limits]
+# cpu_ms = 30000
+
 # D1 数据库配置
 [[d1_databases]]
 binding = "DB"

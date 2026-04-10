@@ -171,16 +171,18 @@ async function callAI(
         return;
       }
 
+      const pending = streamedSinceLastEmit;
+      streamedSinceLastEmit = '';
+      lastStreamEmitAt = now;
+
       await context.onLiveLog?.({
         level: 'info',
         stepNumber: options.stepNumber,
         stepName: options.stepName,
         episodeNumber: options.episodeNumber,
         message: `[AI Output Stream] ${provider.name}/${activeModel}`,
-        detail: streamedSinceLastEmit,
+        detail: pending,
       });
-      streamedSinceLastEmit = '';
-      lastStreamEmitAt = now;
     };
 
     await context.onLog?.({
@@ -202,6 +204,7 @@ async function callAI(
     });
 
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
     try {
       heartbeatTimer = setInterval(() => {
@@ -279,19 +282,21 @@ async function callAI(
         },
       });
 
+      timeoutTimer = null;
       const timeoutPromise = new Promise<never>((_, reject) => {
-        const timer = setTimeout(() => {
+        timeoutTimer = setTimeout(() => {
           abortController.abort(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
           reject(new Error(`AI调用超时 (${timeoutMs / 1000}秒)`));
         }, timeoutMs);
         context.abortSignal?.addEventListener('abort', () => {
-          clearTimeout(timer);
+          clearTimeout(timeoutTimer);
           abortController.abort(new Error('PIPELINE_ABORTED'));
           reject(new Error('PIPELINE_ABORTED'));
         }, { once: true });
       });
 
       const response = await Promise.race([aiPromise, timeoutPromise]);
+      clearTimeout(timeoutTimer);
       await emitStreamChunk(true);
       const elapsedMs = Date.now() - startedAt;
       const usage = response.usage
@@ -390,6 +395,7 @@ async function callAI(
 
       return runAttempt(attempt + 1, true, compressedSystem, compressedUser);
     } finally {
+      clearTimeout(timeoutTimer);
       context.abortSignal?.removeEventListener('abort', onAbort);
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);

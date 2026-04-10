@@ -126,10 +126,15 @@ async function sendToClient(client: StreamClient, event: string, data: unknown):
   }
 
   try {
-    await client.writer.write(
-      client.encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-    );
-    return true;
+    const payload = client.encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    const writeResult = await Promise.race([
+      client.writer.write(payload).then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 5000)),
+    ]);
+    if (!writeResult) {
+      client.closed = true;
+    }
+    return writeResult;
   } catch {
     client.closed = true;
     return false;
@@ -602,7 +607,7 @@ pipelineRoutes.post('/:id/resume', jwtAuth, async (c) => {
       message: '任务已恢复',
       detail: `渠道=${aiSelection.serviceName}，模型=${aiSelection.model || 'default'}`,
     });
-    await broadcastPipelineLog(taskId, resumeLog);
+    void broadcastPipelineLog(taskId, resumeLog).catch(() => {});
 
     // 重新启动流水线
     c.executionCtx.waitUntil(
